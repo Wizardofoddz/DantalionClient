@@ -1,0 +1,6 @@
+{
+  "IMAGER_MANAGER": "Controller",
+  "CONTROLLERS": "cancer",
+  "PORT": "7777",
+  "NUM_IMAGERS_CONTROLLER": "2"
+}

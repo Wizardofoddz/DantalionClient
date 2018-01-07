@@ -1,0 +1,14 @@
+digraph {
+  "FindChessboard" [shape="cylinder" color="green" style="filled" fillcolor="yellow"];
+  "ComputeIntrinsics" [shape="cylinder" color="red"];
+  "RAWIMAGE" [shape="box3d" color="blue"];
+  "BOARDSIZE" [shape="box3d" color="blue"];
+  "IMAGESIZE" [shape="box3d" color="blue"];
+
+  "Back" -> "Forth" [color="orange" label="weee"];
+  "Forth" -> "Back" [color="purple" label="eeew"];
+
+  "Other" -> "Forth"
+  "Other" -> "Back"
+}
+
