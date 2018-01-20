@@ -59,26 +59,61 @@ class IDEFProcess(ABC):
 
     @abstractmethod
     def output_ready(self):
+        """
+        Test for a process output
+        :return: True if there is data available
+        :rtype:
+        """
         pass
 
     @abstractmethod
     def initialize_containers(self):
+        """
+        After containers are created and bound, this routine can fill the ones owned by the process
+        with data
+        """
         pass
 
     @abstractmethod
     def create_stages(self):
+        """
+        Create all of the named stages in this process and place them in the stages dictionary
+
+        This routine will create new instances of every stage in the process, assign them specific
+        names, and add them to the stage dictionary.
+        """
         pass
 
     def on_completion(self):
+        """
+        Called when the internal stage logic has marked the process complete
+
+        This may automatically restart the process, as with the differential view
+        :return:
+        :rtype:
+        """
         pass
 
     def get_container(self, name):
+        """
+        Search global and local container names for the given name and return the associated container
+        :param name: Name of desired container
+        :type name: basestring
+        :return: Returns the located container or None
+        :rtype: DataContainer
+        """
         result = self.global_variables.get(name)
         if result is None:
             result = self.locals.get(name)
         return result
 
     def run_stages(self):
+        """
+        Search through the stages for any reporting that they are ready to run and run their process
+        On completion, this will release the process lock
+        :return:
+        :rtype:
+        """
         try:
             for key, aStage in self.stages.items():
                 if aStage.is_ready_to_run():
@@ -182,6 +217,14 @@ class IDEFStage(ABC):
         cs[container.name] = container
 
     def get_connection_set(self, connection):
+        """
+        Abstracts the difference between connection types and lets consuming logic simply operate on the list
+        result
+        :param connection: Connection surface idenfitier
+        :type connection: EConnection
+        :return: the data containers bound to this connection surface
+        :rtype: [DataContainer]
+        """
         if connection == EConnection.Input:
             return self.input_containers
         if connection == EConnection.Output:
@@ -193,6 +236,17 @@ class IDEFStage(ABC):
         return None
 
     def is_container_valid(self, connection, name, datadir):
+        """
+        Test a container for data operations - this ensures that container directionality is maintained
+        :param connection: identifies connection surface
+        :type connection: EConnection
+        :param name: Name of the container on the connection surface
+        :type name: basestring
+        :param datadir: Required data direction for the container
+        :type datadir: EDataDirection
+        :return: true if the named container on the given surface can be used in this data direction
+        :rtype: bool
+        """
         connections = self.get_connection_set(connection)
         binding = connections[name]
         if binding is not None:
@@ -201,6 +255,9 @@ class IDEFStage(ABC):
 
 
 class EContainerType(Enum):
+    """
+    Type definition for specific container type
+    """
     UNKNOWN = 1
     MATRIXCONTAINER = 2
     CAMERA_INTRINSICS = 5
@@ -208,6 +265,9 @@ class EContainerType(Enum):
 
 
 class EDataDirection(Enum):
+    """
+    Defines direction of data flow where outputs are writes and inputs are reads
+    """
     Unknown = 0
     Input = 1
     Output = 2
@@ -215,7 +275,15 @@ class EDataDirection(Enum):
 
 
 class DataContainer(ABC):
+    """
+    Abstract based class for all data containers
+    """
     def __init__(self, name):
+        """
+        Set name to given value and initialize data direction to unknown
+        :param name:
+        :type name:
+        """
         self.name = name
         self.data_direction = EDataDirection.Unknown
 

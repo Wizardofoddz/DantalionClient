@@ -50,17 +50,17 @@ class IntrinsicsCalculatorProcess(IDEFProcess):
         self.locals[sc.name] = sc
 
         sc = self.get_container('IMAGESIZE')
-        sc.value = (640, 480)
+        sc.value = self.targetImager.get_resolution()
         sc.data_direction = EDataDirection.Input
         self.locals[sc.name] = sc
 
         sc = self.get_container('MATCHCOUNT')
-        sc.value = 24
+        sc.value = 48
         sc.data_direction = EDataDirection.Input
         self.locals[sc.name] = sc
 
         sc = self.get_container('MATCHSEPARATION')
-        sc.value = 35
+        sc.value = 5
         sc.data_direction = EDataDirection.Input
         self.locals[sc.name] = sc
 
@@ -70,6 +70,10 @@ class IntrinsicsCalculatorProcess(IDEFProcess):
         self.locals[sc.name] = sc
 
         sc = self.get_container('CAMERAINTRINSICS')
+        sc.data_direction = EDataDirection.Output
+        self.locals[sc.name] = sc
+
+        sc = self.get_container('REPROJECTIONERROR')
         sc.data_direction = EDataDirection.Output
         self.locals[sc.name] = sc
 
@@ -84,6 +88,8 @@ class IntrinsicsCalculatorProcess(IDEFProcess):
             Notifier.activeNotifier.speak_message("completed")
         ds = self.stages['DistortionCalculatorStage']
         intrinsics = ds.output_containers['CAMERAINTRINSICS']  # type: CameraIntrinsicsContainer
+        reperr = ds.output_containers['REPROJECTIONERROR']  # type: ScalarContainer
+        self.status_message("Reprojection error is {}".format(reperr.value))
         cfg = intrinsics.serialize_intrinsics(1.0)
         self.targetImager.controller.publish_message(self.targetImager.imager_address, "intrinsics", cfg)
         filename = self.targetImager.calibration_filename()

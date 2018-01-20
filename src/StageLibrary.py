@@ -6,7 +6,7 @@ import numpy as np
 
 from Notification import Notifier
 from ProcessAbstractionLayer import IDEFStage, IDEFStageBinding, EConnection, EContainerType, EDataDirection, \
-    CameraIntrinsicsContainer
+    CameraIntrinsicsContainer, ScalarContainer
 
 
 class DifferentialStage(IDEFStage):
@@ -121,8 +121,8 @@ class CalibrationStage(IDEFStage):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         ret, corners = cv2.findChessboardCorners(gray, boardsize)
         if ret:
-            corners2 = cv2.cornerSubPix(gray, corners, (9, 7), (-1, -1),
-                                        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01))
+            corners2 = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1),
+                                        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.0001))
             corner_container.value = corners2
             # mark the output valid
             self.output_containers['CURRENTCHESSBOARDCORNERS'].data_direction = EDataDirection.Input
@@ -165,7 +165,9 @@ class DistortionCalculatorStage(IDEFStage):
                           IDEFStageBinding(EConnection.Environment, EContainerType.SCALARCONTAINER,
                                            EDataDirection.InputOutput, 'CHESSBOARDCORNERLIST'),
                           IDEFStageBinding(EConnection.Output, EContainerType.CAMERA_INTRINSICS,
-                                           EDataDirection.Output, 'CAMERAINTRINSICS')]
+                                           EDataDirection.Output, 'CAMERAINTRINSICS'),
+                          IDEFStageBinding(EConnection.Output, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Output, 'REPROJECTIONERROR')]
         return container_list
 
     def initialize_container_impedance(self):
@@ -180,7 +182,8 @@ class DistortionCalculatorStage(IDEFStage):
                 and self.is_container_valid(EConnection.Control, 'MATCHSEPARATION', EDataDirection.Input)
                 and self.is_container_valid(EConnection.Control, 'IMAGESIZE', EDataDirection.Input)
                 and self.is_container_valid(EConnection.Environment, 'CHESSBOARDCORNERLIST', EDataDirection.InputOutput)
-                and self.is_container_valid(EConnection.Output, 'CAMERAINTRINSICS', EDataDirection.Output))
+                and self.is_container_valid(EConnection.Output, 'CAMERAINTRINSICS', EDataDirection.Output)
+                and self.is_container_valid(EConnection.Output, 'REPROJECTIONERROR', EDataDirection.Output))
 
     def is_output_ready(self):
         return self.is_container_valid(EConnection.Output, 'CAMERAINTRINSICS', EDataDirection.Input)
@@ -220,24 +223,27 @@ class DistortionCalculatorStage(IDEFStage):
                         Notifier.activeNotifier.speak_message("Calculating")
                     # prepare object points, like (0,0,0), (1,0,0), (2,0,0) ....,(6,5,0)
                     objp = np.zeros((boardsize[0] * boardsize[1], 3), np.float32)
-                    objp[:, :2] = np.mgrid[0:boardsize[1], 0:boardsize[0]].T.reshape(-1, 2)
+                    objp[:, :2] = np.mgrid[0:boardsize[0], 0:boardsize[1]].T.reshape(-1, 2)
                     oblocs = []
                     for i in range(0, len(cornerlist)):
                         oblocs.append(objp)
+
                     ret, k, dist, rvecs, tvecs = cv2.calibrateCamera(oblocs, cornerlist,
                                                                      (imagesize[0],
                                                                       imagesize[1]),
                                                                      None, None)
                     if ret:
                         intrinsics = self.output_containers['CAMERAINTRINSICS']  # type: CameraIntrinsicsContainer
+                        reprojerr = self.output_containers['REPROJECTIONERROR']  # type: ScalarContainer
                         re = self.compute_reprojection_error(cornerlist, oblocs, k, dist, rvecs, tvecs)
-                        print("Reprojection error is : {}".format(re))
+                        reprojerr.value = re
                         intrinsics.camera_matrix = k
                         intrinsics.distortion_coefficients = dist
                         intrinsics.rotation_vectors = rvecs
                         intrinsics.translation_vectors = tvecs
                         # output is ready for consumer
                         intrinsics.data_direction = EDataDirection.Input
+                        reprojerr.data_direction = EDataDirection.Input
                         # and we're done
                         self.host_process.completed = True
                         print("intrinsics computed")

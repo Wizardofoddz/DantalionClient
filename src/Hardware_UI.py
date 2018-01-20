@@ -3,13 +3,10 @@ Low level GUI for talking to camera hardware and low level processes
 """
 import tkinter as tk
 from datetime import datetime
+import io
 
 import cv2
-from PIL import Image
-from PIL import ImageTk
-import cv2
-import math
-from PIL import ImageTk, Image
+from PIL import ImageTk, Image, ExifTags
 
 import tkinter as tk
 
@@ -24,7 +21,7 @@ class MasterControl(tk.Frame):
     The top level application window for the application
     """
     root = None
-
+    application_singleton = None
     @staticmethod
     def run():
 
@@ -57,15 +54,19 @@ class MasterControl(tk.Frame):
 
     def __init__(self, parent, *args, **kwargs):
         super(MasterControl, self).__init__(parent)
-
+        application_singleton = self
         tk.Frame.__init__(self, parent, *args, **kwargs)
-
+        self.pack(fill=tk.BOTH, expand=tk.YES, side=tk.LEFT)
         self.parent = parent
+        # start the notification service - note this is platform specific!
         MacNotifier()
 
-        self.calibrator_display_window = None
-        self.imager_display_window = None
+        self.alpha_imager = None
+        self.beta_imager = None
+        self.common_data = None
 
+        self.jitter_var = tk.IntVar()
+        self.jitter_var.set(0)
         image = ImageTk.PhotoImage(Image.open("../resources/console.jpg"))
         ctl = tk.Label(self, image=image)
         ctl.image = image
@@ -73,16 +74,20 @@ class MasterControl(tk.Frame):
 
         self.after(2000, self.open_display)
 
-        HAL.Controller.initialize_controllers()
+        HAL.Controller.initialize_controllers(self)
 
     def open_display(self):
         for widget in self.winfo_children():
             widget.destroy()
         # todo Controller selection currently hardwired to zero
-        calibrator = UI.ImagerPanel(self, self, HAL.Controller.Controllers[0].imagers[0])
-        calibrator.pack(fill=tk.BOTH, expand=tk.YES, side=tk.LEFT)
-        calibrator = UI.ImagerPanel(self, self, HAL.Controller.Controllers[0].imagers[1])
-        calibrator.pack(fill=tk.BOTH, expand=tk.YES, side=tk.RIGHT)
+        self.alpha_imager = UI.ImagerPanel(self, HAL.Controller.Controllers[0].imagers[0])
+        self.alpha_imager.pack(fill=tk.BOTH, expand=tk.YES, side=tk.LEFT)
+        self.common_data = tk.Frame(self, width=15)
+        tk.Label(self.common_data, text="Jitter").pack(side=tk.TOP)
+        tk.Label(self.common_data, textvariable=self.jitter_var).pack(side=tk.TOP)
+        self.common_data.pack(fill=tk.Y, expand=tk.NO, side=tk.LEFT)
+        self.beta_imager = UI.ImagerPanel(self, HAL.Controller.Controllers[0].imagers[1])
+        self.beta_imager.pack(fill=tk.BOTH, expand=tk.YES, side=tk.RIGHT)
 
 
 class ImagerPanel(tk.Frame):
@@ -91,12 +96,10 @@ class ImagerPanel(tk.Frame):
         # event.widget.imager.toggle_camera()
         print('livk')
 
-    def __init__(self, parent, host, imager, *args, **kwargs):
+    def __init__(self, parent, imager, *args, **kwargs):
         tk.Frame.__init__(self, parent, padx=10, pady=10, bd=5, relief=tk.RAISED)
         self.imager = imager
         self.serial_update_index = 0
-        self.height = self.winfo_reqheight()
-        self.width = self.winfo_reqwidth()
 
         "top row that carries info"
         toprow = tk.Frame(self)
@@ -111,6 +114,7 @@ class ImagerPanel(tk.Frame):
         self.selected_imager_channel.set('raw')
         self.imager_channels = tk.OptionMenu(toprow, self.selected_imager_channel, *choices)
         self.imager_channels.pack(side=tk.LEFT)
+
         self.label_framerate = tk.Label(toprow, text="0000")
         self.label_framerate.pack(side=tk.RIGHT)
 
@@ -121,20 +125,48 @@ class ImagerPanel(tk.Frame):
         tk.Button(self.programbuttons, width=10, text="Calibrate", command=self.start_calibration).pack(side=tk.TOP)
         tk.Button(self.programbuttons, width=10, text="Uncalibr", command=self.stop_calibration).pack(side=tk.TOP)
         tk.Button(self.programbuttons, width=10, text="Diff", command=self.start_differential).pack(side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="Reset FPS", command=self.imager.reset_fps_samples).pack(
+            side=tk.TOP)
         self.programbuttons.pack(side=tk.LEFT)
-        self.imager_display = tk.Canvas(centerrow, bd=6, highlightthickness=3, width=640, height=480)
+        self.imager_display = tk.Canvas(centerrow, bd=6, highlightthickness=3)
 
         self.imager_display.image_id = None
         self.imager_display.imager = self.imager
         self.imager_display.imager.display = self.imager_display
         self.imager_display.imager.updateNotifier = self.update_image
 
-        self.imager_display.pack(side=tk.LEFT)
+        self.imager_display.pack(side=tk.LEFT, fill=tk.BOTH, expand=tk.YES)
 
+        # camera control buttons
         self.controlbuttons = tk.Frame(centerrow)
+        self.build_control_buttons()
+        self.controlbuttons.pack(side=tk.LEFT)
 
+        centerrow.pack(side=tk.TOP, fill=tk.BOTH, expand=tk.YES)
+
+        bottomrow = tk.Frame(self)
+        self.status_line = tk.Label(bottomrow, text="Hi there!")
+        self.status_line.pack(side=tk.LEFT)
+        bottomrow.pack(side=tk.TOP)
+        self.status_update()
+        self.capture_update()
+
+    def build_control_buttons(self):
+        """
+        Create and attach all of the camera control buttons
+        :return: self changed as side effect
+        :rtype:
+        """
+        tk.Button(self.controlbuttons, width=10, text="REBOOT",
+                  command=self.imager.reboot).pack(side=tk.TOP)
         tk.Button(self.controlbuttons, width=10, text="Set Intrins",
                   command=self.set_calibration).pack(side=tk.TOP)
+        tk.Scale(self.controlbuttons, width=10, from_=4, to=63, orient=tk.HORIZONTAL, tickinterval=16,
+                 command=self.set_quantization).pack(side=tk.TOP)
+        rez = [('160x120', 1), ('176x144', 2), ('320x240', 3), ('352x288', 4),
+               ('640x480', 5), ('800x600', 6), ('1024x768', 7), ('1280x1024', 8),
+               ('1600x1200', 9), ('1280x960', 10), ('2048x1536', 11), ('2592x1944', 12)]
+        self.build_control_menu(self.controlbuttons, "Resolution", "resolution", rez)
         lm = [('auto', 0), ('sun', 1), ('cloud', 2), ('office', 3), ('home', 4)]
         self.build_control_menu(self.controlbuttons, "Light", "lightmode", lm)
         self.build_fixed_level_menu(self.controlbuttons, "Bright", "brightness")
@@ -144,16 +176,13 @@ class ImagerPanel(tk.Frame):
                ('BWNegative', 6), ('Normal', 7), ('Sepia', 8), ('OverExpose', 9), ('Solatize', 10), ('WHAT?', 11),
                ('Yellowish', 12)]
         self.build_control_menu(self.controlbuttons, "Special", "specialeffects", sem)
-        self.controlbuttons.pack(side=tk.LEFT)
+        state = [('Normal', 0), ('Flip', 1), ('Mirror', 2), ('Both', 3)]
+        self.build_control_menu(self.controlbuttons, "Orient", "mirrorflip", state)
+        yuv = [('Y U Y V', 0), ('Y V Y U', 1), ('V Y U Y', 2), ('U Y V Y', 3)]
+        self.build_control_menu(self.controlbuttons, "YUV", "setyuv", yuv)
 
-        centerrow.pack(side=tk.TOP)
-
-        bottomrow = tk.Frame(self)
-        self.status_line = tk.Label(bottomrow, text="Hi there!")
-        self.status_line.pack(side=tk.LEFT)
-        bottomrow.pack(side=tk.TOP)
-        self.status_update()
-        self.capture_update()
+    def set_quantization(self, quantizeLevel):
+        self.set_camera_control('quantization', quantizeLevel)
 
     def build_fixed_level_menu(self, host_menu, function_name, control_name):
         ml = [('+2', 0), ('+1', 1), ('0', 2), ('-1', 3), ('-2', 4)]
@@ -176,12 +205,10 @@ class ImagerPanel(tk.Frame):
     def update_image(self):
         """
         Perform update of raw image - expected to be asyncronously driven
-        :param imager:
-        :type imager:
         :return:
         :rtype:
         """
-        cv_image = self.imager.get_image(self.selected_imager_channel.get())
+        cv_image = self.imager.get_image(self.selected_imager_channel.get(), False)
         if cv_image is None:
             return
 
@@ -255,10 +282,18 @@ class ImagerPanel(tk.Frame):
         """
         try:
             channelname = self.selected_imager_channel.get()
-            rawimage = self.imager.get_image(channelname)
+            rawimage = self.imager.get_image(channelname, False)
             if rawimage is None:
                 return
-            temp = ImageTk.PhotoImage(image=Image.fromarray(cv2.cvtColor(rawimage, cv2.COLOR_BGR2RGB)))
+            # if channelname == "rectified":
+            #     new_file = open("camimg.jpg", "wb")
+            #     new_file.write(rawimage)
+            #     new_file.close()
+
+            # image = Image.fromarray(cv2.cvtColor(rawimage, cv2.COLOR_BGR2RGB))
+            image = Image.open(io.BytesIO(rawimage))
+
+            temp = ImageTk.PhotoImage(image)
             self.imager.display.image = temp
             if self.imager.display.image_id is None:
                 self.imager.display.image_id = self.imager.display.create_image(0, 0, image=self.imager.display.image,
@@ -277,13 +312,14 @@ class ImagerPanel(tk.Frame):
 
         if self.imager.framerate_sum.total_seconds() == 0:
             return
-        persecond = self.imager.framerate_sum.total_seconds() / self.imager.image_counter
+        persecond = self.imager.framerate_sum.total_seconds() / self.imager.local_image_counter
 
         self.label_framerate.config(text="{0:.2f}".format(1.0 / persecond))
-        self.label_channel.config(text=self.imager.channel)
+
+        #self.label_channel.config(text=self.imager.channel)
 
         self.imager_channels['menu'].delete(0, 'end')
-        for choice in self.imager.channel_images.keys():
+        for choice in self.imager.raw_image.keys():
             self.imager_channels['menu'].add_command(label=choice,
                                                      command=tk._setit(self.selected_imager_channel, choice))
 
