@@ -13,7 +13,7 @@ import tkinter as tk
 import Hardware_UI as UI
 import HardwareAbstractionLayer as HAL
 from Notification import MacNotifier
-from ProcessLibrary import IntrinsicsCalculatorProcess, ImageDifferentialCalculatorProcess
+from ProcessLibrary import IntrinsicsCalculatorProcess, ImageDifferentialCalculatorProcess, StereoCalculatorProcess
 
 
 class MasterControl(tk.Frame):
@@ -22,6 +22,7 @@ class MasterControl(tk.Frame):
     """
     root = None
     application_singleton = None
+
     @staticmethod
     def run():
 
@@ -34,7 +35,7 @@ class MasterControl(tk.Frame):
         MasterControl.root.update_idletasks()
         w = MasterControl.root.winfo_screenwidth()
         h = MasterControl.root.winfo_screenheight()
-        size = (1024, 580)
+        size = (1900, 580)
         x = w / 2 - size[0] / 2
         y = h / 2 - size[1] / 2
         MasterControl.root.geometry("%dx%d+%d+%d" % (size + (x, y)))
@@ -61,10 +62,15 @@ class MasterControl(tk.Frame):
         # start the notification service - note this is platform specific!
         MacNotifier()
 
-        self.alpha_imager = None
-        self.beta_imager = None
+        self.left_imager = None
+        self.right_imager = None
         self.common_data = None
 
+        self.programbuttons = None
+        self.trigger = False;
+        self.stereo_alpha_var = tk.StringVar()
+        self.stereo_alpha_var.set('-1')
+        self.stereo_alpha_var.trace('w', self.update_stereo_alpha)
         self.jitter_var = tk.IntVar()
         self.jitter_var.set(0)
         image = ImageTk.PhotoImage(Image.open("../resources/console.jpg"))
@@ -80,14 +86,81 @@ class MasterControl(tk.Frame):
         for widget in self.winfo_children():
             widget.destroy()
         # todo Controller selection currently hardwired to zero
-        self.alpha_imager = UI.ImagerPanel(self, HAL.Controller.Controllers[0].imagers[0])
-        self.alpha_imager.pack(fill=tk.BOTH, expand=tk.YES, side=tk.LEFT)
-        self.common_data = tk.Frame(self, width=15)
+        imager_pair = tk.Frame(self)
+        self.left_imager = UI.ImagerPanel(imager_pair, HAL.Controller.Controllers[0].imagers[0])
+        self.left_imager.pack(fill=tk.BOTH, expand=tk.YES, side=tk.LEFT)
+        self.common_data = tk.Frame(imager_pair, width=15)
         tk.Label(self.common_data, text="Jitter").pack(side=tk.TOP)
         tk.Label(self.common_data, textvariable=self.jitter_var).pack(side=tk.TOP)
+        self.programbuttons = tk.Frame(self.common_data)
+        tk.Button(self.programbuttons, width=10, text="SterCalib", command=self.start_stereo_calibration).pack(
+            side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="Set Stereo", command=self.set_stereo_calibration).pack(
+            side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="Trigger", command=self.set_trigger).pack(side=tk.TOP)
+        self.programbuttons.pack()
+        tk.Entry(self.common_data, textvariable=self.stereo_alpha_var).pack(side=tk.TOP)
         self.common_data.pack(fill=tk.Y, expand=tk.NO, side=tk.LEFT)
-        self.beta_imager = UI.ImagerPanel(self, HAL.Controller.Controllers[0].imagers[1])
-        self.beta_imager.pack(fill=tk.BOTH, expand=tk.YES, side=tk.RIGHT)
+        self.right_imager = UI.ImagerPanel(imager_pair, HAL.Controller.Controllers[0].imagers[1])
+        self.right_imager.pack(fill=tk.BOTH, expand=tk.YES, side=tk.RIGHT)
+        imager_pair.pack(fill=tk.BOTH, expand=tk.YES, side=tk.TOP)
+        bottomrow = tk.Frame(self)
+        self.status_line = tk.Label(bottomrow, text="Main Message Display")
+        self.status_line.pack(side=tk.LEFT)
+        bottomrow.pack(side=tk.TOP)
+        self.update_status_display()
+
+    def set_trigger(self):
+        self.trigger = True
+
+    def update_stereo_alpha(self, a, b, c):
+        alpha = float(self.stereo_alpha_var.get())
+        HAL.Controller.Controllers[0].publish_message(HAL.Controller.Controllers[0].imagers[0].imager_address,
+                                                      'stereo_rectify_alpha', alpha)
+
+    def stereo_calibration_filename(self):
+        """
+        Location of precomputed calibration file with camera intrinsics and stereo extrinsics
+        :return: Location of precomputed calibration file with camera intrinsics
+        :rtype: basestring
+        """
+        filename = "stereo_{}_0.json".format(HAL.Controller.Controllers[0].resource)
+        return "../resources/" + filename
+
+    def set_stereo_calibration(self):
+        filename = self.stereo_calibration_filename()
+        with open(filename, "r") as file:
+            cfg = file.read()
+            HAL.Controller.Controllers[0].publish_message(0, "stereoextrinsics", cfg)
+
+    def start_stereo_calibration(self):
+        leftimager = HAL.Controller.Controllers[0].imagers[0]
+        rightimager = HAL.Controller.Controllers[0].imagers[1]
+
+        icp = StereoCalculatorProcess("StereoCalculatorProcess", leftimager, rightimager)
+        icp.initialize()
+        icp.status_message = self.change_status_message
+        leftimager.processes['SterCalib'] = icp
+
+    def update_status_display(self):
+        for name, button in self.programbuttons.children.items():
+            label = button['text']
+            if label in HAL.Controller.Controllers[0].imagers[0].processes:
+                button.configure(highlightbackground='blue')
+            else:
+                button.configure(highlightbackground='green')
+        self.update()
+        self.after(2000, self.update_status_display)
+
+    def change_status_message(self, text):
+        """
+        Replace status line text with the provided text
+        :param text:
+        :type text:
+        :return:
+        :rtype:
+        """
+        self.status_line.config(text=text)
 
 
 class ImagerPanel(tk.Frame):
@@ -104,7 +177,7 @@ class ImagerPanel(tk.Frame):
         "top row that carries info"
         toprow = tk.Frame(self)
         tk.Label(toprow, text="{}:{}".format(self.imager.controller.resource,
-                                             'A' if self.imager.imager_address == 0 else 'O')).pack(
+                                             'Left' if self.imager.imager_address == 0 else 'Right')).pack(
             side=tk.LEFT)
         self.label_channel = tk.Label(toprow, text="UNKNOWN")
         self.label_channel.pack(side=tk.LEFT)
@@ -128,8 +201,15 @@ class ImagerPanel(tk.Frame):
         tk.Button(self.programbuttons, width=10, text="Reset FPS", command=self.imager.reset_fps_samples).pack(
             side=tk.TOP)
         self.programbuttons.pack(side=tk.LEFT)
-        self.imager_display = tk.Canvas(centerrow, bd=6, highlightthickness=3)
-
+        canvas_frame = tk.Frame(centerrow)
+        self.imager_display = tk.Canvas(canvas_frame, bd=6, highlightthickness=3, scrollregion=(0, 0, 500, 500))
+        hbar = tk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL)
+        hbar.pack(side=tk.BOTTOM, fill=tk.X)
+        hbar.config(command=self.imager_display.xview)
+        vbar = tk.Scrollbar(canvas_frame, orient=tk.VERTICAL)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+        vbar.config(command=self.imager_display.yview)
+        self.imager_display.config(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
         self.imager_display.image_id = None
         self.imager_display.imager = self.imager
         self.imager_display.imager.display = self.imager_display
@@ -137,6 +217,7 @@ class ImagerPanel(tk.Frame):
 
         self.imager_display.pack(side=tk.LEFT, fill=tk.BOTH, expand=tk.YES)
 
+        canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=tk.YES)
         # camera control buttons
         self.controlbuttons = tk.Frame(centerrow)
         self.build_control_buttons()
@@ -145,7 +226,7 @@ class ImagerPanel(tk.Frame):
         centerrow.pack(side=tk.TOP, fill=tk.BOTH, expand=tk.YES)
 
         bottomrow = tk.Frame(self)
-        self.status_line = tk.Label(bottomrow, text="Hi there!")
+        self.status_line = tk.Label(bottomrow, text="Imager Message Display")
         self.status_line.pack(side=tk.LEFT)
         bottomrow.pack(side=tk.TOP)
         self.status_update()
@@ -228,11 +309,11 @@ class ImagerPanel(tk.Frame):
     def stop_calibration(self):
         self.imager.controller.publish_message(self.imager.imager_address, "intrinsics", None)
 
+    def get_calibration(self):
+        return self.imager.get_calibration()
+
     def set_calibration(self):
-        filename = self.imager.calibration_filename()
-        with open(filename, "r") as file:
-            cfg = file.read()
-            self.imager.controller.publish_message(self.imager.imager_address, "intrinsics", cfg)
+        self.imager.set_calibration()
 
     def start_differential(self):
         # we want undistorted
@@ -281,20 +362,11 @@ class ImagerPanel(tk.Frame):
         :rtype:
         """
         try:
-            channelname = self.selected_imager_channel.get()
-            rawimage = self.imager.get_image(channelname, False)
+            rawimage = self.imager.get_image(self.selected_imager_channel.get(), False)
             if rawimage is None:
                 return
-            # if channelname == "rectified":
-            #     new_file = open("camimg.jpg", "wb")
-            #     new_file.write(rawimage)
-            #     new_file.close()
 
-            # image = Image.fromarray(cv2.cvtColor(rawimage, cv2.COLOR_BGR2RGB))
-            image = Image.open(io.BytesIO(rawimage))
-
-            temp = ImageTk.PhotoImage(image)
-            self.imager.display.image = temp
+            self.imager.display.image = ImageTk.PhotoImage(Image.open(io.BytesIO(rawimage)))
             if self.imager.display.image_id is None:
                 self.imager.display.image_id = self.imager.display.create_image(0, 0, image=self.imager.display.image,
                                                                                 anchor='nw')
@@ -316,7 +388,7 @@ class ImagerPanel(tk.Frame):
 
         self.label_framerate.config(text="{0:.2f}".format(1.0 / persecond))
 
-        #self.label_channel.config(text=self.imager.channel)
+        # self.label_channel.config(text=self.imager.channel)
 
         self.imager_channels['menu'].delete(0, 'end')
         for choice in self.imager.raw_image.keys():

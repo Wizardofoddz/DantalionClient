@@ -130,7 +130,119 @@ class CalibrationStage(IDEFStage):
             self.input_containers['RAWIMAGE'].data_direction = EDataDirection.Output
 
 
-class DistortionCalculatorStage(IDEFStage):
+class StereoCalibrationStage(IDEFStage):
+    """
+    Hunts for checkerboard patterns and passes them off to consumers when found
+    """
+
+    def __init__(self, host, name):
+        super().__init__(host, name)
+
+    def get_required_containers(self):
+        """
+        Working image in RAWIMAGE, # squares on UV axes in BOARDSIZE, and an output listing located
+        corners in CURRENTCHESSBOARDCORNERS
+        :return:
+        :rtype:
+        """
+        container_list = [IDEFStageBinding(EConnection.Input, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Input, "RAWIMAGELEFT"),
+                          IDEFStageBinding(EConnection.Input, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Input, "RAWIMAGERIGHT"),
+                          IDEFStageBinding(EConnection.Control, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Input, "BOARDSIZE"),
+                          IDEFStageBinding(EConnection.Output, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Output, "CURRENTCHESSBOARDCORNERSLEFT"),
+                          IDEFStageBinding(EConnection.Output, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Output, "CURRENTCHESSBOARDCORNERSRIGHT")]
+        return container_list
+
+    def initialize_container_impedance(self):
+        self.output_containers['CURRENTCHESSBOARDCORNERSLEFT'].value = None
+        self.output_containers['CURRENTCHESSBOARDCORNERSLEFT'].data_direction = EDataDirection.Output
+        self.output_containers['CURRENTCHESSBOARDCORNERSRIGHT'].value = None
+        self.output_containers['CURRENTCHESSBOARDCORNERSRIGHT'].data_direction = EDataDirection.Output
+
+    def is_ready_to_run(self):
+        return (self.is_container_valid(EConnection.Output, 'CURRENTCHESSBOARDCORNERSLEFT', EDataDirection.Output)
+                and self.is_container_valid(EConnection.Output, 'CURRENTCHESSBOARDCORNERSRIGHT', EDataDirection.Output)
+                and self.is_container_valid(EConnection.Control, 'BOARDSIZE', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Input, 'RAWIMAGELEFT', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Input, 'RAWIMAGERIGHT', EDataDirection.Input))
+
+    def is_output_ready(self):
+        return (self.is_container_valid(EConnection.Output, 'CURRENTCHESSBOARDCORNERSLEFT', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Output, 'CURRENTCHESSBOARDCORNERSRIGHT', EDataDirection.Input))
+
+    def process(self):
+        # a base assumption is that candidate images are correlated
+        left_image = self.input_containers['RAWIMAGELEFT'].matrix
+        right_image = self.input_containers['RAWIMAGERIGHT'].matrix
+        boardsize = self.control_containers['BOARDSIZE'].value
+        left_corner_container = self.output_containers['CURRENTCHESSBOARDCORNERSLEFT']
+        right_corner_container = self.output_containers['CURRENTCHESSBOARDCORNERSRIGHT']
+
+        # prepare object points, like (0,0,0), (1,0,0), (2,0,0) ....,(6,5,0)
+        objp = np.zeros((9 * 7, 3), np.float32)
+        objp[:, :2] = np.mgrid[0:9, 0:7].T.reshape(-1, 2)
+
+        left_gray = cv2.cvtColor(left_image, cv2.COLOR_BGR2GRAY)
+        right_gray = None
+        left_ret, left_corners = cv2.findChessboardCorners(left_gray, boardsize)
+        right_ret = False
+        right_corners = None
+        if left_ret:
+            right_gray = cv2.cvtColor(right_image, cv2.COLOR_BGR2GRAY)
+            right_ret, right_corners = cv2.findChessboardCorners(right_gray, boardsize)
+
+        if left_ret and right_ret:
+            left_corners2 = cv2.cornerSubPix(left_gray, left_corners, (5, 5), (-1, -1),
+                                             (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.0001))
+            right_corners2 = cv2.cornerSubPix(right_gray, right_corners, (5, 5), (-1, -1),
+                                              (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.0001))
+            left_corner_container.value = left_corners2
+            right_corner_container.value = right_corners2
+            # mark the output valid
+            self.output_containers['CURRENTCHESSBOARDCORNERSLEFT'].data_direction = EDataDirection.Input
+            self.output_containers['CURRENTCHESSBOARDCORNERSRIGHT'].data_direction = EDataDirection.Input
+        else:
+            self.input_containers['RAWIMAGELEFT'].data_direction = EDataDirection.Output
+            self.input_containers['RAWIMAGERIGHT'].data_direction = EDataDirection.Output
+
+
+class ChessboardProcessorStage(IDEFStage):
+    def initialize_container_impedance(self):
+        pass
+
+    def is_ready_to_run(self):
+        pass
+
+    def is_output_ready(self):
+        pass
+
+    def process(self):
+        pass
+
+    def get_required_containers(self):
+        pass
+
+    @staticmethod
+    def compute_reprojection_error(imgpoints, objpoints, k, dist, rvecs, tvecs):
+        mean_error = 0
+        for i in range(len(objpoints)):
+            imgpoints2, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], k, dist)
+            error = cv2.norm(imgpoints[i], imgpoints2, cv2.NORM_L2) / len(imgpoints2)
+            mean_error += error
+
+        return mean_error / len(objpoints)
+
+    @staticmethod
+    def average_corner(corners):
+        mean = abs(np.mean(corners, axis=0))
+        return mean
+
+
+class DistortionCalculatorStage(ChessboardProcessorStage):
     """Processes located checkerboard patterns to compute lens intrinsics"""
 
     def __init__(self, host, name):
@@ -252,15 +364,181 @@ class DistortionCalculatorStage(IDEFStage):
         self.input_containers['RAWIMAGE'].data_direction = EDataDirection.Output
         self.input_containers['CURRENTCHESSBOARDCORNERS'].data_direction = EDataDirection.Output
 
-    def compute_reprojection_error(self, imgpoints, objpoints, k, dist, rvecs, tvecs):
-        mean_error = 0
-        for i in range(len(objpoints)):
-            imgpoints2, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], k, dist)
-            error = cv2.norm(imgpoints[i], imgpoints2, cv2.NORM_L2) / len(imgpoints2)
-            mean_error += error
 
-        return mean_error / len(objpoints)
+class StereoCalibratorCalculatorStage(ChessboardProcessorStage):
+    """Processes located checkerboard patterns to compute interlens stereo transform"""
 
-    def average_corner(self, corners):
-        mean = abs(np.mean(corners, axis=0))
-        return mean
+    def __init__(self, host, name):
+        super().__init__(host, name)
+
+    def get_required_containers(self):
+        """
+        RAWIMAGE is used to show accepted checkerboard, CURRENTCHESSBOARDCORNERS is the new
+        set of corners, BOARDSIZE defines uv dimensions of checkerboard, MATCHCOUNT defines
+        the number of samples required, MATCHSEPARATION defines the minimum distance between
+        samples, IMAGESIZE defines source image size,RECTIFY_ALPHA defines alpha rectification
+        coefficient where 0 is all points, and 1 is only valid points, CHESSBOARDCORNERLIST for
+        storing the collected chessboard corners,and CAMERAINSTRINCS for reported calculated camera
+        matrix and distortion coefficients
+        :return:
+        :rtype:
+        """
+        container_list = [IDEFStageBinding(EConnection.Input, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Input, "RAWIMAGELEFT"),
+                          IDEFStageBinding(EConnection.Input, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Input, "RAWIMAGERIGHT"),
+                          IDEFStageBinding(EConnection.Input, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Input, "CAMERAMATRIXLEFT"),
+                          IDEFStageBinding(EConnection.Input, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Input, "CAMERAMATRIXRIGHT"),
+                          IDEFStageBinding(EConnection.Input, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Input, "DISTORTIONCOEFFSLEFT"),
+                          IDEFStageBinding(EConnection.Input, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Input, "DISTORTIONCOEFFSRIGHT"),
+                          IDEFStageBinding(EConnection.Input, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Input, 'CURRENTCHESSBOARDCORNERSLEFT'),
+                          IDEFStageBinding(EConnection.Input, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Input, 'CURRENTCHESSBOARDCORNERSRIGHT'),
+                          IDEFStageBinding(EConnection.Control, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Input, 'IMAGESIZE'),
+                          IDEFStageBinding(EConnection.Control, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Input, 'BOARDSIZE'),
+                          IDEFStageBinding(EConnection.Control, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Input, 'MATCHCOUNT'),
+                          IDEFStageBinding(EConnection.Control, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Input, 'MATCHSEPARATION'),
+                          IDEFStageBinding(EConnection.Control, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Input, 'IMAGESIZE'),
+                          IDEFStageBinding(EConnection.Environment, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.InputOutput, 'CHESSBOARDCORNERLISTLEFT'),
+                          IDEFStageBinding(EConnection.Environment, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.InputOutput, 'CHESSBOARDCORNERLISTRIGHT'),
+                          IDEFStageBinding(EConnection.Output, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Output, 'STEREOROTATION'),
+                          IDEFStageBinding(EConnection.Output, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Output, 'STEREOTRANSLATION'),
+                          IDEFStageBinding(EConnection.Output, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Output, 'ESSENTIAL'),
+                          IDEFStageBinding(EConnection.Output, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Output, 'FUNDAMENTAL'),
+                          IDEFStageBinding(EConnection.Output, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Output, 'RMS_STEREO')]
+        return container_list
+
+    def initialize_container_impedance(self):
+        self.environment_containers['CHESSBOARDCORNERLISTLEFT'].data_direction = EDataDirection.InputOutput
+        self.environment_containers['CHESSBOARDCORNERLISTLEFT'].value = []
+        self.environment_containers['CHESSBOARDCORNERLISTRIGHT'].data_direction = EDataDirection.InputOutput
+        self.environment_containers['CHESSBOARDCORNERLISTRIGHT'].value = []
+        self.output_containers['STEREOROTATION'].data_direction = EDataDirection.Output
+        self.output_containers['STEREOTRANSLATION'].data_direction = EDataDirection.Output
+        self.output_containers['ESSENTIAL'].data_direction = EDataDirection.Output
+        self.output_containers['FUNDAMENTAL'].data_direction = EDataDirection.Output
+        self.output_containers['RMS_STEREO'].data_direction = EDataDirection.Output
+
+    def is_ready_to_run(self):
+        return (self.is_container_valid(EConnection.Input, 'CURRENTCHESSBOARDCORNERSLEFT', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Input, 'CURRENTCHESSBOARDCORNERSRIGHT', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Control, 'BOARDSIZE', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Control, 'MATCHCOUNT', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Control, 'MATCHSEPARATION', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Control, 'IMAGESIZE', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Environment, 'CHESSBOARDCORNERLISTLEFT',
+                                            EDataDirection.InputOutput)
+                and self.is_container_valid(EConnection.Environment, 'CHESSBOARDCORNERLISTRIGHT',
+                                            EDataDirection.InputOutput)
+                and self.is_container_valid(EConnection.Output, 'STEREOROTATION', EDataDirection.Output)
+                and self.is_container_valid(EConnection.Output, 'STEREOTRANSLATION', EDataDirection.Output)
+                and self.is_container_valid(EConnection.Output, 'ESSENTIAL', EDataDirection.Output)
+                and self.is_container_valid(EConnection.Output, 'FUNDAMENTAL', EDataDirection.Output)
+                and self.is_container_valid(EConnection.Output, 'RMS_STEREO', EDataDirection.Output))
+
+    def is_output_ready(self):
+        return (self.is_container_valid(EConnection.Output, 'STEREOROTATION', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Output, 'STEREOTRANSLATION', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Output, 'ESSENTIAL', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Output, 'FUNDAMENTAL', EDataDirection.Input)
+                and self.is_container_valid(EConnection.Output, 'RMS_STEREO', EDataDirection.Input))
+
+    def process(self):
+        print('analyse')
+        boardsize = self.control_containers['BOARDSIZE'].value
+        imagesize = self.control_containers['IMAGESIZE'].value
+        mindistance = self.control_containers['MATCHSEPARATION'].value
+        matchcount = self.control_containers['MATCHCOUNT'].value
+        left_corner_container = self.input_containers['CURRENTCHESSBOARDCORNERSLEFT']
+        right_corner_container = self.input_containers['CURRENTCHESSBOARDCORNERSRIGHT']
+        left_cornerlist = self.environment_containers['CHESSBOARDCORNERLISTLEFT'].value
+        right_cornerlist = self.environment_containers['CHESSBOARDCORNERLISTRIGHT'].value
+
+        left_cm = self.input_containers['CAMERAMATRIXLEFT'].matrix
+        right_cm = self.input_containers['CAMERAMATRIXRIGHT'].matrix
+        left_dc = self.input_containers['DISTORTIONCOEFFSLEFT'].matrix
+        right_dc = self.input_containers['DISTORTIONCOEFFSRIGHT'].matrix
+        self.host_process.status_message(
+            "Processing {} of {} stereo calibration tests".format(len(left_cornerlist), matchcount))
+        left_avgpt = self.average_corner(left_corner_container.value)
+        right_avgpt = self.average_corner(right_corner_container.value)
+        if len(left_cornerlist) == 0:
+            left_cornerlist.append(left_corner_container.value)
+            right_cornerlist.append(right_corner_container.value)
+            self.input_containers['CURRENTCHESSBOARDCORNERSLEFT'].data_direction = EDataDirection.Output
+            self.input_containers['CURRENTCHESSBOARDCORNERSRIGHT'].data_direction = EDataDirection.Output
+        else:
+            reject = False
+            for corners in left_cornerlist:
+                t_avg = self.average_corner(corners)
+                dist = cv2.norm(t_avg - left_avgpt)
+                if dist <= mindistance:
+                    reject = True
+                    break
+            if not reject:
+                for corners in right_cornerlist:
+                    t_avg = self.average_corner(corners)
+                    dist = cv2.norm(t_avg - right_avgpt)
+                    if dist <= mindistance:
+                        reject = True
+                        break
+            # has to be distinct in both environments
+            if not reject:
+                if len(left_cornerlist) < matchcount:
+                    left_cornerlist.append(left_corner_container.value)
+                    right_cornerlist.append(right_corner_container.value)
+                    if len(left_cornerlist) % (matchcount / 4) == 0 and Notifier.activeNotifier is not None:
+                        Notifier.activeNotifier.play_soundfile_async('bityes.wav')
+                else:
+                    if Notifier.activeNotifier is not None:
+                        Notifier.activeNotifier.speak_message("Calculating")
+                    # prepare object points, like (0,0,0), (1,0,0), (2,0,0) ....,(6,5,0)
+                    objp = np.zeros((boardsize[0] * boardsize[1], 3), np.float32)
+                    objp[:, :2] = np.mgrid[0:boardsize[0], 0:boardsize[1]].T.reshape(-1, 2)
+                    oblocs = []
+                    for i in range(0, len(left_cornerlist)):
+                        oblocs.append(objp)
+                    rotation_out = None
+                    translation_out = None
+                    essential_out = None
+                    fundamental_out = None
+                    (rms_stereo, camera_matrix_l, dist_coeffs_l, camera_matrix_r, dist_coeffs_r, R, T, E, F) = \
+                        cv2.stereoCalibrate(oblocs, left_cornerlist, right_cornerlist, left_cm, left_dc, right_cm,
+                                            right_dc,
+                                            imagesize, flags=cv2.CALIB_FIX_INTRINSIC)
+
+                    self.output_containers['RMS_STEREO'].set_output_for_subsequent_input(rms_stereo)
+                    self.output_containers['STEREOROTATION'].set_output_for_subsequent_input(R)
+                    self.output_containers['STEREOTRANSLATION'].set_output_for_subsequent_input(T)
+                    self.output_containers['ESSENTIAL'].set_output_for_subsequent_input(E)
+                    self.output_containers['FUNDAMENTAL'].set_output_for_subsequent_input(F)
+
+                    # in case things got recomputed
+                    self.input_containers['CAMERAMATRIXLEFT'].matrix = camera_matrix_l
+                    self.input_containers['CAMERAMATRIXRIGHT'].matrix = camera_matrix_r
+                    self.input_containers['DISTORTIONCOEFFSLEFT'].matrix = dist_coeffs_l
+                    self.input_containers['DISTORTIONCOEFFSRIGHT'].matrix = dist_coeffs_r
+
+                    self.host_process.completed = True
+                    print("stereo completed computed")
+        self.input_containers['RAWIMAGELEFT'].data_direction = EDataDirection.Output
+        self.input_containers['RAWIMAGERIGHT'].data_direction = EDataDirection.Output
+        self.input_containers['CURRENTCHESSBOARDCORNERSLEFT'].data_direction = EDataDirection.Output
+        self.input_containers['CURRENTCHESSBOARDCORNERSRIGHT'].data_direction = EDataDirection.Output

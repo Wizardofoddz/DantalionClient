@@ -119,18 +119,20 @@ class IDEFProcess(ABC):
                 if aStage.is_ready_to_run():
                     # print('dispatching stage {}'.format(aStage.name))
                     aStage.process()
+                    if self.completed:
+                        self.on_completion()
+                        break
         finally:
             self.processLock.release()
 
     def process(self):
         if not self.processLock.acquire(False):
             return
-
-        t = threading.Thread(target=self.run_stages)
-        t.start()
+        else:
+            t = threading.Thread(target=self.run_stages)
+            t.start()
         # self.run_stages()
-        if self.completed:
-            self.on_completion()
+
 
     def allocate_containers(self):
         for key, aStage in self.stages.items():
@@ -291,6 +293,10 @@ class DataContainer(ABC):
     def get_container_type(self):
         return EContainerType.UNKNOWN
 
+    @abstractmethod
+    def set_output_for_subsequent_input(self, data):
+        self.data_direction = EDataDirection.Input
+
     def has_valid_input(self):
         return self.data_direction == EDataDirection.Input
 
@@ -326,6 +332,10 @@ class CameraIntrinsicsContainer(DataContainer):
 
     def get_container_type(self):
         return EContainerType.CAMERA_INTRINSICS
+
+    def set_output_for_subsequent_input(self, data):
+        raise ValueError('CameraIntrinsicsContainer does not support general output')
+        super(CameraIntrinsicsContainer, self).set_output_for_subsequent_input(data)
 
     def serialize_intrinsics(self, rectify_alpha):
         """
@@ -368,6 +378,9 @@ class MatrixContainer(DataContainer):
     def get_container_type(self):
         return EContainerType.MATRIXCONTAINER
 
+    def set_output_for_subsequent_input(self, data):
+        self.matrix = data
+        super(MatrixContainer, self).set_output_for_subsequent_input(data)
 
 class ScalarContainer(DataContainer):
     def __init__(self, name):
@@ -377,6 +390,10 @@ class ScalarContainer(DataContainer):
 
     def get_container_type(self):
         return EContainerType.SCALARCONTAINER
+
+    def set_output_for_subsequent_input(self, data):
+        self.value = data
+        super(ScalarContainer, self).set_output_for_subsequent_input(data)
 
     def set_boolean(self, v):
         self.scalar_type = EScalarType.Boolean

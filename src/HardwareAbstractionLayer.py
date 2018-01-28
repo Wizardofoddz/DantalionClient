@@ -120,8 +120,8 @@ class Controller:
         Return the opposite camera imager
         :param imager:
         :type imager:
-        :return:
-        :rtype:
+        :return: the opposite imager
+        :rtype: Imager
         """
         if self.imagers[0] == imager:
             return self.imagers[1]
@@ -188,29 +188,29 @@ class Imager(object):
 
     def get_resolution(self):
         if self.resolution_code == 1:
-            return (160, 120)
+            return 160, 120
         elif self.resolution_code == 2:
-            return (176, 144)
+            return 176, 144
         elif self.resolution_code == 3:
-            return (320, 240)
+            return 320, 240
         elif self.resolution_code == 4:
-            return (352, 288)
+            return 352, 288
         elif self.resolution_code == 5:
-            return (640, 480)
+            return 640, 480
         elif self.resolution_code == 6:
-            return (800, 600)
+            return 800, 600
         elif self.resolution_code == 7:
-            return (1024, 768)
+            return 1024, 768
         elif self.resolution_code == 8:
-            return (1280, 1024)
+            return 1280, 1024
         elif self.resolution_code == 9:
-            return (1600, 1200)
+            return 1600, 1200
         elif self.resolution_code == 10:
-            return (1280, 960)
+            return 1280, 960
         elif self.resolution_code == 11:
-            return (2048, 1536)
+            return 2048, 1536
         elif self.resolution_code == 12:
-            return (2592, 1944)
+            return 2592, 1944
         else:
             return None
 
@@ -345,13 +345,25 @@ class Imager(object):
 
     def dispatch_processes(self):
         for name, idef_process in list(self.processes.items()):
-            if idef_process.get_container('RAWIMAGE').data_direction == EDataDirection.Output:
-                idef_process.get_container('RAWIMAGE').matrix = self.get_image('raw', True)
-                idef_process.get_container('RAWIMAGE').data_direction = EDataDirection.Input
-
+            is_mono = idef_process.get_container('RAWIMAGE') is not None
+            if is_mono:
+                if idef_process.get_container('RAWIMAGE').data_direction == EDataDirection.Output:
+                    idef_process.get_container('RAWIMAGE').matrix = self.get_image('raw', True)
+                    idef_process.get_container('RAWIMAGE').data_direction = EDataDirection.Input
+            else:
+                if self.controller.master_control.jitter_var.get() > 220:
+                    # if not self.controller.master_control.trigger:
+                    continue
+                self.controller.master_control.trigger = False;
+                if (idef_process.get_container('RAWIMAGELEFT').data_direction == EDataDirection.Output
+                        and idef_process.get_container('RAWIMAGERIGHT').data_direction == EDataDirection.Output):
+                    idef_process.get_container('RAWIMAGELEFT').matrix = self.get_image('raw', True)
+                    idef_process.get_container('RAWIMAGERIGHT').matrix = \
+                        self.controller.antipode(self).get_image('raw', True)
+                    idef_process.get_container('RAWIMAGELEFT').data_direction = EDataDirection.Input
+                    idef_process.get_container('RAWIMAGERIGHT').data_direction = EDataDirection.Input
             idef_process.process()
             if idef_process.completed:
-                # now what the hell are you going to do ??????
                 del self.processes[name]
 
     def calibration_filename(self):
@@ -363,3 +375,24 @@ class Imager(object):
         filename = "calibration_{}_{}.json".format(self.controller.resource,
                                                    self.imager_address)
         return "../resources/" + filename
+
+    def stereo_filename(self):
+        """
+        Location of precomputed calibration file with camera intrinsics
+        :return: Location of precomputed calibration file with camera intrinsics
+        :rtype: basestring
+        """
+        filename = "stereo_{}_{}.json".format(self.controller.resource,
+                                              self.imager_address)
+        return "../resources/" + filename
+
+    def get_calibration(self):
+        filename = self.calibration_filename()
+        with open(filename, "r") as file:
+            return file.read()
+
+    def set_calibration(self):
+        filename = self.calibration_filename()
+        with open(filename, "r") as file:
+            cfg = file.read()
+            self.controller.publish_message(self.imager_address, "intrinsics", cfg)
