@@ -6,9 +6,16 @@ building blocks.
 """
 import json
 import threading
+import uuid
 from abc import ABC, abstractmethod
+from collections import deque
 from enum import Enum
 from threading import Lock
+
+import cv2
+import os
+
+import datetime
 
 
 class EScope(Enum):
@@ -27,9 +34,154 @@ class IDEFProcess(ABC):
     """
     Defines the generic process that operates on data containers via a collection of stages
     """
+    ActiveProcesses = {}
+    ImageQueues = {}
+    Jitter = 0
+    Run = True
 
+    DataReady = threading.Event()
+
+    @staticmethod
+    def initialize_image_intake(stereo_controllers):
+        for acontroller in stereo_controllers:
+            IDEFProcess.ImageQueues[acontroller + '_LEFT'] = deque()
+            IDEFProcess.ImageQueues[acontroller + '_RIGHT'] = deque()
+
+    @staticmethod
+    def post_image(controller_name, isleft, channel, imageinfo):
+        """
+        Add an image to the end of it's appropriate intake queue and pulse data input signal
+        :param controller:
+        :type controller:
+        :param side: -1 for left, 0 for mono, and 1 for right
+        :type side:
+        :param imageinfo:
+        :type imageinfo: tuple of (opencv image matrix,image metadata)
+        :return:
+        :rtype:
+        """
+        if channel != 'raw':
+            return
+        name = controller_name
+        if isleft:
+            name += "_LEFT"
+        else:
+            name += "_RIGHT"
+
+        cloned = (imageinfo[0].copy(), imageinfo[1])
+        IDEFProcess.ImageQueues[name].append(cloned)
+        if len(IDEFProcess.ActiveProcesses) > 0:
+            IDEFProcess.DataReady.set()
+
+    @staticmethod
+    def bind_imager_input_functions(imager):
+        """
+        The
+        :param imager:
+        :type imager:
+        :return:
+        :rtype:
+        """
+        imager.submit_image_to_processes = lambda ctlr_name, isleft, channel, imageinfo: IDEFProcess.post_image(
+            ctlr_name,
+            isleft,
+            channel,
+            imageinfo)
+
+    @staticmethod
+    def add_process(idef_process):
+        IDEFProcess.ActiveProcesses[idef_process.name] = idef_process
+        IDEFProcess.DataReady.set()
+
+    @staticmethod
+    def process_dispatcher():
+        while IDEFProcess.Run:
+            for name, idef_process in list(IDEFProcess.ActiveProcesses.items()):
+                is_mono = idef_process.has_container('RAWIMAGE')
+                if is_mono:
+                    if idef_process.get_container('RAWIMAGE').data_direction == EDataDirection.Output:
+                        qn = idef_process.controller_name + '_LEFT' if idef_process.targetImager.index == 0 else idef_process.controller_name + "_RIGHT"
+                        ql = len(IDEFProcess.ImageQueues[qn])
+                        if ql >= 30:
+                            print('resync q {}={}'.format(qn, len(IDEFProcess.ImageQueues[qn])))
+                            IDEFProcess.ImageQueues[qn].clear()
+                            ql = len(IDEFProcess.ImageQueues[qn])  # this better be zero
+                        if ql == 0:
+                            continue;
+                        # single image data always consumed
+                        image, imagametadata = IDEFProcess.ImageQueues[qn].pop()
+                        idef_process.get_container('RAWIMAGE').matrix = image
+                        idef_process.get_container('RAWIMAGE').data_direction = EDataDirection.Input
+                        idef_process.get_container('IMAGER').value = imagametadata.imager
+                        idef_process.get_container('IMAGER').data_direction = EDataDirection.Input
+                elif (idef_process.get_container('RAWIMAGELEFT').data_direction == EDataDirection.Output
+                      and idef_process.get_container('RAWIMAGERIGHT').data_direction == EDataDirection.Output):
+
+                    lqn = idef_process.controller_name + '_LEFT'
+                    rqn = idef_process.controller_name + '_RIGHT'
+
+                    "if either queue is empty NOTHING HAPPENS"
+
+                    if len(IDEFProcess.ImageQueues[lqn]) == 0 or len(IDEFProcess.ImageQueues[rqn]) == 0:
+                        continue;
+                    leftimage, leftimagametadata = IDEFProcess.ImageQueues[lqn][0]  # peek at leftmost item
+                    rightimage, rightimagemetadata = IDEFProcess.ImageQueues[rqn][0]  # peek at leftmost item
+
+                    "the oldest image WILL ALWAYS be consumed"
+                    leftyoungest = leftimagametadata.timestamp >= rightimagemetadata.timestamp
+                    if leftyoungest:
+                        rightimage, rightimagemetadata = IDEFProcess.ImageQueues[rqn].pop()
+                    else:
+                        leftimage, leftimagametadata = IDEFProcess.ImageQueues[lqn].pop()
+
+                    tdelta = (leftimagametadata.timestamp - rightimagemetadata.timestamp).total_seconds()
+                    IDEFProcess.Jitter = abs(int(tdelta * 1000))
+                    if IDEFProcess.Jitter > 1000:
+                        print('resync L={},R={}'.format(len(IDEFProcess.ImageQueues[lqn]),
+                                                        len(IDEFProcess.ImageQueues[rqn])))
+                        IDEFProcess.ImageQueues[lqn].clear()
+                        IDEFProcess.ImageQueues[rqn].clear()
+                        continue
+
+                    if IDEFProcess.Jitter > 800:
+                        # if not self.controller.master_control.trigger:
+                        continue
+                    "the youngest image WILL ONLY be consumed if this is under the jitter limit"
+                    if leftyoungest:
+                        leftimage, leftimagametadata = IDEFProcess.ImageQueues[lqn].pop()
+                    else:
+                        rightimage, rightimagemetadata = IDEFProcess.ImageQueues[rqn].pop()
+
+                    if True:
+                        idef_process.get_container('RAWIMAGELEFT').matrix = leftimage
+                        idef_process.get_container('RAWIMAGERIGHT').matrix = rightimage
+                        idef_process.get_container('RAWIMAGELEFT').data_direction = EDataDirection.Input
+                        idef_process.get_container('RAWIMAGERIGHT').data_direction = EDataDirection.Input
+                        idef_process.get_container('LEFTIMAGER').value = leftimagametadata.imager
+                        idef_process.get_container('RIGHTIMAGER').value = rightimagemetadata.imager
+                        idef_process.get_container('LEFTIMAGER').data_direction = EDataDirection.Input
+                        idef_process.get_container('RIGHTIMAGER').data_direction = EDataDirection.Input
+
+                idef_process.process()
+                if idef_process.completed:
+                    print('deleting process {}'.format(name))
+                    del IDEFProcess.ActiveProcesses[name]
+                break
+            IDEFProcess.DataReady.clear()
+            IDEFProcess.DataReady.wait()
+    @staticmethod
+    def serialize_matrix_to_json(m):
+        cm = []
+        cm.append(m.shape[0])
+        cm.append(m.shape[1])
+        for i in range(m.shape[0]):
+            for j in range(m.shape[1]):
+                cm.append(m.item((i, j)))
+        return cm
     def __init__(self, name):
         self.name = name
+
+        self.controller_name = 'cancer'
         self.global_variables = {}
         self.children = {}
         self.locals = {}
@@ -40,11 +192,18 @@ class IDEFProcess(ABC):
         self.targetImager = None
         self.processLock = Lock()
 
-    def initialize(self):
+    def initialize(self,kvp):
         self.create_stages()
         self.allocate_containers()
         self.bind_containers()
         self.initialize_containers()
+        for n,v in kvp.items():
+            c = self.get_container(n)
+            if c.get_container_type() == EContainerType.SCALARCONTAINER:
+                c.value = v;
+            elif c.get_container_type() == EContainerType.MATRIXCONTAINER:
+                c.matrix = v;
+
 
     def send_status_message(self, text):
         """
@@ -84,6 +243,10 @@ class IDEFProcess(ABC):
         """
         pass
 
+    @abstractmethod
+    def get_required_containers(self):
+        pass
+
     def on_completion(self):
         """
         Called when the internal stage logic has marked the process complete
@@ -96,7 +259,7 @@ class IDEFProcess(ABC):
 
     def get_container(self, name):
         """
-        Search global and local container names for the given name and return the associated container
+        Search global and local container names for the given container_name and return the associated container
         :param name: Name of desired container
         :type name: basestring
         :return: Returns the located container or None
@@ -107,6 +270,11 @@ class IDEFProcess(ABC):
             result = self.locals.get(name)
         return result
 
+    def has_container(self, name):
+        if name in self.global_variables:
+            return True
+        return name in self.locals
+
     def run_stages(self):
         """
         Search through the stages for any reporting that they are ready to run and run their process
@@ -115,13 +283,14 @@ class IDEFProcess(ABC):
         :rtype:
         """
         try:
-            for key, aStage in self.stages.items():
-                if aStage.is_ready_to_run():
-                    # print('dispatching stage {}'.format(aStage.name))
-                    aStage.process()
-                    if self.completed:
-                        self.on_completion()
-                        break
+            if not self.completed:
+                for key, aStage in self.stages.items():
+                    if aStage.is_ready_to_run():
+                        # print('dispatching stage {}'.format(aStage.container_name))
+                        aStage.process()
+                        if self.completed:
+                            self.on_completion()
+                            break
         finally:
             self.processLock.release()
 
@@ -130,13 +299,14 @@ class IDEFProcess(ABC):
             return
         else:
             t = threading.Thread(target=self.run_stages)
+            t.daemon = True
             t.start()
         # self.run_stages()
-
 
     def allocate_containers(self):
         for key, aStage in self.stages.items():
             bindings = aStage.get_required_containers()
+            bindings.extend(self.get_required_containers())
             for aBinding in bindings:
                 if aBinding.name in self.global_variables:
                     if self.global_variables[aBinding.name].get_container_type() != aBinding.container_type:
@@ -152,6 +322,7 @@ class IDEFProcess(ABC):
     def bind_containers(self):
         for key, aStage in self.stages.items():
             bindings = aStage.get_required_containers()
+            bindings.extend(self.get_required_containers())
             for aBinding in bindings:
                 dc = self.locals[aBinding.name]
                 if dc is None:
@@ -184,11 +355,11 @@ class IDEFStage(ABC):
 
         :param host_process: The process that contains this stage instance
         :type host_process: IDEFProcess
-        :param name: The name of this stage within the host process scope
+        :param name: The container_name of this stage within the host process scope
         :type name: basestring
         """
         self.host_process = host_process
-        self.name = name
+        self.container_name = name
         self.input_containers = {}
         self.output_containers = {}
         self.control_containers = {}
@@ -196,23 +367,23 @@ class IDEFStage(ABC):
 
     @abstractmethod
     def get_required_containers(self):
-        print('must override')
+        pass
 
     @abstractmethod
     def initialize_container_impedance(self):
-        print('must override')
+        pass
 
     @abstractmethod
     def is_ready_to_run(self):
-        print('must override')
+        pass
 
     @abstractmethod
     def is_output_ready(self):
-        print('must override')
+        pass
 
     @abstractmethod
     def process(self):
-        print('must override')
+        pass
 
     def bind_container(self, connection, container):
         cs = self.get_connection_set(connection)
@@ -280,14 +451,16 @@ class DataContainer(ABC):
     """
     Abstract based class for all data containers
     """
+
     def __init__(self, name):
         """
-        Set name to given value and initialize data direction to unknown
+        Set container_name to given value and initialize data direction to unknown
         :param name:
         :type name:
         """
         self.name = name
         self.data_direction = EDataDirection.Unknown
+        self.identifier = uuid.uuid4()
 
     @abstractmethod
     def get_container_type(self):
@@ -305,8 +478,6 @@ class DataContainer(ABC):
         result = None
         if container_type == EContainerType.MATRIXCONTAINER:
             result = MatrixContainer(name)
-        elif container_type == EContainerType.CAMERA_INTRINSICS:
-            result = CameraIntrinsicsContainer(name)
         elif container_type == EContainerType.SCALARCONTAINER:
             result = ScalarContainer(name)
         return result
@@ -322,54 +493,6 @@ class EScalarType(Enum):
     CvSize = 6
 
 
-class CameraIntrinsicsContainer(DataContainer):
-    def __init__(self, name):
-        super().__init__(name)
-        self.camera_matrix = None
-        self.distortion_coefficients = None
-        self.rotation_vectors = None
-        self.translation_vectors = None
-
-    def get_container_type(self):
-        return EContainerType.CAMERA_INTRINSICS
-
-    def set_output_for_subsequent_input(self, data):
-        raise ValueError('CameraIntrinsicsContainer does not support general output')
-        super(CameraIntrinsicsContainer, self).set_output_for_subsequent_input(data)
-
-    def serialize_intrinsics(self, rectify_alpha):
-        """
-        Serialize the data that represents the camera intrinsics
-        :param rectify_alpha: 0 for only good pixels, 1 for all pixels where outer black pixels are invalid
-        :type rectify_alpha: float
-        :return: serialized JSON representation
-        :rtype: string
-        """
-        dd = {}
-        dd['rectify_alpha'] = rectify_alpha
-        dd['camera_matrix'] = self.flatten_matrix(self.camera_matrix)
-        dd['distortion_coefficients'] = self.flatten_matrix(self.distortion_coefficients)
-
-        serialized = json.dumps(dd, ensure_ascii=False)
-        return serialized
-
-    def flatten_matrix(self, m):
-        cm = []
-        cm.append(m.shape[0])
-        cm.append(m.shape[1])
-        for i in range(m.shape[0]):
-            for j in range(m.shape[1]):
-                cm.append(m.item((i, j)))
-        return cm
-
-    def print_matrix(self, m):
-        for i in range(m.shape[0]):
-            for j in range(m.shape[1]):
-                print(m.item(i, j), end='')
-                print(',', end='')
-            print()
-
-
 class MatrixContainer(DataContainer):
     def __init__(self, name):
         super().__init__(name)
@@ -381,6 +504,7 @@ class MatrixContainer(DataContainer):
     def set_output_for_subsequent_input(self, data):
         self.matrix = data
         super(MatrixContainer, self).set_output_for_subsequent_input(data)
+
 
 class ScalarContainer(DataContainer):
     def __init__(self, name):

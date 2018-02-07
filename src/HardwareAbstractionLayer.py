@@ -39,7 +39,7 @@ class Controller:
     This is meant to be subclassed so that specific subclasses may implement the get_imager_data
     function with respect to their particular hardware environment -
     Attributes:
-        resource(str): Identifies the IP or domain name of the hardware controller controller
+        resource(str): Identifies the IP or domain container_name of the hardware controller controller
         port(int): Identifies the port uses for communication with the controller
 
     """
@@ -88,7 +88,7 @@ class Controller:
     def __init__(self, resource, port, resource_id, master_control) -> None:
         """Initialize a hardware controller and the hardware imagers under it's control
 
-        :param resource: IP or DNS name of the server
+        :param resource: IP or DNS container_name of the server
         :type resource: str
         :param port: Assigned TCP port number on server
         :type port: int
@@ -132,6 +132,12 @@ class Controller:
         topic = 'camctl/{}/{}'.format(cameraId, subtopic)
         self.mqtt_client.publish(topic, message)
 
+    def get_left_imager(self):
+        return self.imagers[0]
+
+    def get_right_imager(self):
+        return self.imagers[1]
+
     def get_imager(self, ordinal):
         return self.imagers[ordinal]
 
@@ -140,9 +146,10 @@ class Controller:
 
 
 class ImagerImageData(object):
-    def __init__(self, host, camera_index, image_number, timestamp):
+    def __init__(self, host, camera_index, imager, image_number, timestamp):
         self.host = host
         self.camera_index = camera_index
+        self.imager = imager
         self.image_number = image_number
         self.timestamp = timestamp
 
@@ -168,7 +175,6 @@ class Imager(object):
         """
         super().__init__()
         self.imager_address = imager_address
-        self.display = None
         self.controller = controller
         self.index = camIndex
         self.updateNotifier = None
@@ -179,12 +185,13 @@ class Imager(object):
         self.framerate_sum = datetime.timedelta(0)
         self.reset_fps_samples()
 
-        self.processes = {}
         self.status = "ONLINE"
         self.cv2_image_array = {}
         self.raw_image = {}
         self.image_metadata = {}
         self.resolution_code = 5
+        # how to deliver stereo images for processing
+        self.process_stereo_publisher = None
 
     def get_resolution(self):
         if self.resolution_code == 1:
@@ -268,6 +275,18 @@ class Imager(object):
             return search[channel]
         return None
 
+    def set_image(self, channel, rawdata, cvdata):
+        if rawdata is None and cvdata is not None:
+            rawdata = cv2.imencode('.jpg', cvdata)[1]
+        elif cvdata is None and rawdata is not None:
+            cvdata = cv2.imdecode(np.asarray(rawdata, dtype="uint8"), cv2.IMREAD_COLOR)
+        if rawdata is None and cvdata is None:
+            self.raw_image.pop(channel)
+            self.cv2_image_array.pop(channel)
+        elif rawdata is not None and cvdata is not None:
+            self.raw_image[channel] = rawdata
+            self.cv2_image_array[channel] = cvdata
+
     def process_live_image(self, rawdata, channel):
         """ Asyncronous update of images received from the controller/imager and triggered dispatch of processes
 
@@ -287,35 +306,28 @@ class Imager(object):
 
             image = Image.open(io.BytesIO(rawdata))
             exif_data = image._getexif()
-            if exif_data is None:
-                print('missing exif data')
-            else:
-                exif = {
-                    ExifTags.TAGS[k]: v
-                    for k, v in exif_data.items()
-                    if k in ExifTags.TAGS
-                }
+            exif = {
+                ExifTags.TAGS[k]: v
+                for k, v in exif_data.items()
+                if k in ExifTags.TAGS
+            }
 
-                # parse the baseline datetime
-                intime = exif['DateTimeOriginal']
-                timestamp = datetime.datetime.strptime(intime, '%Y-%m-%d %H:%M:%S')
-                msec = int(exif['SubsecTimeOriginal'])
-                timestamp = timestamp + datetime.timedelta(milliseconds=msec)
+            # parse the baseline datetime
+            intime = exif['DateTimeOriginal']
+            timestamp = datetime.datetime.strptime(intime, '%Y-%m-%d %H:%M:%S')
+            msec = int(exif['SubsecTimeOriginal'])
+            timestamp = timestamp + datetime.timedelta(milliseconds=msec)
 
-                image_number = int(exif['ImageNumber'])
-                host = exif['HostComputer'].split('.')
+            image_number = int(exif['ImageNumber'])
+            host = exif['HostComputer'].split('.')
 
-                self.image_metadata[channel] = ImagerImageData(host[0], host[1], image_number, timestamp)
+            self.image_metadata[channel] = ImagerImageData(host[0], host[1], self, image_number, timestamp)
 
-            self.dispatch_processes()
+            if self.submit_image_to_processes is not None:
+                self.submit_image_to_processes(self.controller.resource, self.imager_address == 0,channel,
+                                               (self.cv2_image_array[channel], self.image_metadata[channel]))
             if channel == 'raw':
                 self.local_image_counter += 1
-            alt_imager = self.controller.antipode(self)
-            if channel in self.image_metadata and channel in alt_imager.image_metadata:
-                tdelta = (self.image_metadata[channel].timestamp - alt_imager.image_metadata[
-                    channel].timestamp).total_seconds()
-                tdelta = abs(int(tdelta * 1000))
-                self.controller.master_control.jitter_var.set(tdelta)
         except ValueError:
             print('i blew up')
             # self.raw_image[channel] = None
@@ -342,29 +354,6 @@ class Imager(object):
         """
         topic = "camctl/{}/{}".format(self.index, message)
         self.controller.mqtt_client.publish(topic, body)
-
-    def dispatch_processes(self):
-        for name, idef_process in list(self.processes.items()):
-            is_mono = idef_process.get_container('RAWIMAGE') is not None
-            if is_mono:
-                if idef_process.get_container('RAWIMAGE').data_direction == EDataDirection.Output:
-                    idef_process.get_container('RAWIMAGE').matrix = self.get_image('raw', True)
-                    idef_process.get_container('RAWIMAGE').data_direction = EDataDirection.Input
-            else:
-                if self.controller.master_control.jitter_var.get() > 220:
-                    # if not self.controller.master_control.trigger:
-                    continue
-                self.controller.master_control.trigger = False;
-                if (idef_process.get_container('RAWIMAGELEFT').data_direction == EDataDirection.Output
-                        and idef_process.get_container('RAWIMAGERIGHT').data_direction == EDataDirection.Output):
-                    idef_process.get_container('RAWIMAGELEFT').matrix = self.get_image('raw', True)
-                    idef_process.get_container('RAWIMAGERIGHT').matrix = \
-                        self.controller.antipode(self).get_image('raw', True)
-                    idef_process.get_container('RAWIMAGELEFT').data_direction = EDataDirection.Input
-                    idef_process.get_container('RAWIMAGERIGHT').data_direction = EDataDirection.Input
-            idef_process.process()
-            if idef_process.completed:
-                del self.processes[name]
 
     def calibration_filename(self):
         """

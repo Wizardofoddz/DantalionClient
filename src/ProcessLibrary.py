@@ -1,10 +1,14 @@
 import json
+import uuid
+import os
+import datetime
 
+import cv2
 import numpy
 
 from Notification import Notifier
-from ProcessAbstractionLayer import IDEFProcess, CameraIntrinsicsContainer, \
-    EDataDirection
+from ProcessAbstractionLayer import IDEFProcess, \
+    EDataDirection, IDEFStageBinding, EConnection, EContainerType
 from StageLibrary import CalibrationStage, DistortionCalculatorStage, DifferentialStage, \
     StereoCalibratorCalculatorStage, StereoCalibrationStage
 
@@ -13,6 +17,10 @@ class ImageDifferentialCalculatorProcess(IDEFProcess):
     def __init__(self, name, targetImager):
         IDEFProcess.__init__(self, name)
         self.targetImager = targetImager
+
+
+    def get_required_containers(self):
+        return []
 
     def output_ready(self):
         return self.stages["DifferentialStage"].is_output_ready()
@@ -26,7 +34,7 @@ class ImageDifferentialCalculatorProcess(IDEFProcess):
     def create_stages(self):
         x = [DifferentialStage(self, 'DifferentialStage')]
         for aStage in x:
-            self.stages[aStage.name] = aStage
+            self.stages[aStage.container_name] = aStage
 
     def on_completion(self):
         ds = self.stages['DifferentialStage']
@@ -45,6 +53,12 @@ class IntrinsicsCalculatorProcess(IDEFProcess):
         IDEFProcess.__init__(self, name)
         self.targetImager = targetImager
 
+
+    def get_required_containers(self):
+        container_list = [IDEFStageBinding(EConnection.Input, EContainerType.MATRIXCONTAINER,
+                                           EDataDirection.Input, "IMAGER")]
+        return container_list
+
     def output_ready(self):
         return self.stages["DistortionCalculatorStage"].is_output_ready()
 
@@ -60,12 +74,17 @@ class IntrinsicsCalculatorProcess(IDEFProcess):
         self.locals[sc.name] = sc
 
         sc = self.get_container('MATCHCOUNT')
-        sc.value = 48
+        sc.value = 4
         sc.data_direction = EDataDirection.Input
         self.locals[sc.name] = sc
 
         sc = self.get_container('MATCHSEPARATION')
-        sc.value = 5
+        sc.value = 2
+        sc.data_direction = EDataDirection.Input
+        self.locals[sc.name] = sc
+
+        sc = self.get_container('MATCHMOVE')
+        sc.value = 20
         sc.data_direction = EDataDirection.Input
         self.locals[sc.name] = sc
 
@@ -82,26 +101,49 @@ class IntrinsicsCalculatorProcess(IDEFProcess):
         sc.data_direction = EDataDirection.Output
         self.locals[sc.name] = sc
 
+
     def create_stages(self):
         x = [CalibrationStage(self, 'CalibrationStage'), DistortionCalculatorStage(self, 'DistortionCalculatorStage')]
         for aStage in x:
-            self.stages[aStage.name] = aStage
+            self.stages[aStage.container_name] = aStage
 
     def on_completion(self):
 
         if Notifier.activeNotifier is not None:
             Notifier.activeNotifier.speak_message("completed")
         ds = self.stages['DistortionCalculatorStage']
-        intrinsics = ds.output_containers['CAMERAINTRINSICS']  # type: CameraIntrinsicsContainer
+        intrinsics = ds.output_containers['CAMERAINTRINSICS'].value  # type: ScalarContainer
         reperr = ds.output_containers['REPROJECTIONERROR']  # type: ScalarContainer
         self.status_message("Reprojection error is {}".format(reperr.value))
-        cfg = intrinsics.serialize_intrinsics(1.0)
+        translated = {}
+        for n,v in intrinsics.items():
+            if isinstance(v,numpy.ndarray):
+                translated[n] = IDEFProcess.serialize_matrix_to_json(v)
+            else:
+                translated[n] = v;
+        translated['TIMESTAMP'] = datetime.datetime.now().isoformat()
+        translated['ID'] = uuid.uuid4().hex
+        imager = self.locals['IMAGER'].value
+        translated['CONTROLLER'] = imager.controller.resource
+        translated['CAMERAINDEX'] = imager.imager_address
+        translated['MATCHCOUNT'] = self.locals['MATCHCOUNT'].value
+        translated['MATCHSEPARATION'] = self.locals['MATCHSEPARATION'].value
+        cfg = json.dumps(translated, ensure_ascii=False)
         self.targetImager.controller.publish_message(self.targetImager.imager_address, "intrinsics", cfg)
         filename = self.targetImager.calibration_filename()
         file = open(filename, "w")
         file.write(cfg)
         file.close()
 
+        filename = "../CalibrationRecords/IntrinsicsHistory.txt"
+        if os.path.isfile(filename):
+            file = open(filename, "a")
+            file.write(",\n")
+        else:
+            file = open(filename, "w")
+
+        file.write(cfg)
+        file.close()
 
 class StereoCalculatorProcess(IDEFProcess):
 
@@ -109,6 +151,11 @@ class StereoCalculatorProcess(IDEFProcess):
         IDEFProcess.__init__(self, name)
         self.targetImagerLeft = targetImagerLeft
         self.targetImagerRight = targetImagerRight
+
+    def get_required_containers(self):
+        container_list = [IDEFStageBinding(EConnection.Control, EContainerType.SCALARCONTAINER,
+                                           EDataDirection.Input, "RECORDING")]
+        return container_list
 
     def output_ready(self):
         return self.stages["StereoCalibrationCalculatorStage"].is_output_ready()
@@ -165,7 +212,7 @@ class StereoCalculatorProcess(IDEFProcess):
         self.locals[sc.name] = sc
 
         sc = self.get_container('MATCHCOUNT')
-        sc.value = 40
+        sc.value = 20
         sc.data_direction = EDataDirection.Input
         self.locals[sc.name] = sc
 
@@ -194,7 +241,7 @@ class StereoCalculatorProcess(IDEFProcess):
         x = [StereoCalibrationStage(self, 'StereoCalibrationStage'),
              StereoCalibratorCalculatorStage(self, 'StereoCalibratorCalculatorStage')]
         for aStage in x:
-            self.stages[aStage.name] = aStage
+            self.stages[aStage.container_name] = aStage
 
     def flatten_matrix(self, m):
         cm = []
@@ -205,13 +252,33 @@ class StereoCalculatorProcess(IDEFProcess):
                 cm.append(m.item((i, j)))
         return cm
 
+    def record_stereo_images(self,controller_name, left, right):
+        fileid = uuid.uuid4().hex
+        self.record_stereo_image(controller_name,left, fileid, 'L')
+        self.record_stereo_image(controller_name,right, fileid, 'R')
+        return fileid
+
+    @staticmethod
+    def stereo_session_image_folder():
+        return "../CalibrationRecords/StereoImages";
+
+    @staticmethod
+    def stereo_sessionfolder():
+        return "../CalibrationRecords/StereoSessions";
+    def record_stereo_image(self, controller_name,image, fileid, stereoSide):
+        filename = StereoCalculatorProcess.stereo_session_image_folder() + "/{}_{}_{}.jpg".format(fileid,
+                                                                            controller_name,
+                                                                            stereoSide)
+        # save the image to a file
+        cv2.imwrite(filename, image, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+
     def on_completion(self):
 
         if Notifier.activeNotifier is not None:
             Notifier.activeNotifier.speak_message("completed")
         ds = self.stages['StereoCalibratorCalculatorStage']
         dd = {}
-        dd['Q'] = str(ds.output_containers['RMS_STEREO'].value)
+        dd['Q'] = str(ds.output_containers['REPROJECTIONERROR'].value)
         dd['R'] = self.flatten_matrix(ds.output_containers['STEREOROTATION'].matrix)  # type: MatrixContainer
         dd['T'] = self.flatten_matrix(ds.output_containers['STEREOTRANSLATION'].matrix)  # type: MatrixContainer
         dd['E'] = self.flatten_matrix(ds.output_containers['ESSENTIAL'].matrix)  # type: MatrixContainer
@@ -229,3 +296,15 @@ class StereoCalculatorProcess(IDEFProcess):
         file = open(filename, "w")
         file.write(serialized)
         file.close()
+
+        # save the recorded session data
+        if self.get_container('RECORDING').value:
+            dd['CALIBRATIONIMAGEHISTORY'] = ds.environment_containers['CALIBRATIONIMAGEHISTORY'].value
+            dd['CONTROLLER'] = 'unknownctlr'
+            dd['timestamp'] = datetime.datetime.now().isoformat()
+            path = StereoCalculatorProcess.stereo_sessionfolder()
+            num_files = sum(os.path.isfile(os.path.join(path, f)) for f in os.listdir(path))
+
+            filename = "../CalibrationRecords/StereoSessions/session.{}.json".format(num_files + 1)
+            with open(filename, 'w') as f:
+                json.dump(dd, f, ensure_ascii=True)
