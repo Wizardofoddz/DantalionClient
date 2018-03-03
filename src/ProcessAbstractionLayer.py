@@ -4,7 +4,7 @@ definition system.  The goal is to allow for the easy construction of image proc
 building blocks.
 
 """
-import json
+import os
 import threading
 import uuid
 from abc import ABC, abstractmethod
@@ -13,9 +13,7 @@ from enum import Enum
 from threading import Lock
 
 import cv2
-import os
-
-import datetime
+import numpy as np
 
 
 class EScope(Enum):
@@ -36,7 +34,6 @@ class IDEFProcess(ABC):
     """
     ActiveProcesses = {}
     ImageQueues = {}
-    Jitter = 0
     Run = True
 
     DataReady = threading.Event()
@@ -51,10 +48,12 @@ class IDEFProcess(ABC):
     def post_image(controller_name, isleft, channel, imageinfo):
         """
         Add an image to the end of it's appropriate intake queue and pulse data input signal
-        :param controller:
-        :type controller:
-        :param side: -1 for left, 0 for mono, and 1 for right
-        :type side:
+        :param channel:
+        :type channel:
+        :param isleft:
+        :type isleft:
+        :param controller_name:
+        :type controller_name:
         :param imageinfo:
         :type imageinfo: tuple of (opencv image matrix,image metadata)
         :return:
@@ -70,8 +69,6 @@ class IDEFProcess(ABC):
 
         cloned = (imageinfo[0].copy(), imageinfo[1])
         IDEFProcess.ImageQueues[name].append(cloned)
-        if len(IDEFProcess.ActiveProcesses) > 0:
-            IDEFProcess.DataReady.set()
 
     @staticmethod
     def bind_imager_input_functions(imager):
@@ -96,79 +93,16 @@ class IDEFProcess(ABC):
     @staticmethod
     def process_dispatcher():
         while IDEFProcess.Run:
+            if len(IDEFProcess.ActiveProcesses) == 0:
+                IDEFProcess.DataReady.wait()
             for name, idef_process in list(IDEFProcess.ActiveProcesses.items()):
-                is_mono = idef_process.has_container('RAWIMAGE')
-                if is_mono:
-                    if idef_process.get_container('RAWIMAGE').data_direction == EDataDirection.Output:
-                        qn = idef_process.controller_name + '_LEFT' if idef_process.targetImager.index == 0 else idef_process.controller_name + "_RIGHT"
-                        ql = len(IDEFProcess.ImageQueues[qn])
-                        if ql >= 30:
-                            print('resync q {}={}'.format(qn, len(IDEFProcess.ImageQueues[qn])))
-                            IDEFProcess.ImageQueues[qn].clear()
-                            ql = len(IDEFProcess.ImageQueues[qn])  # this better be zero
-                        if ql == 0:
-                            continue;
-                        # single image data always consumed
-                        image, imagametadata = IDEFProcess.ImageQueues[qn].pop()
-                        idef_process.get_container('RAWIMAGE').matrix = image
-                        idef_process.get_container('RAWIMAGE').data_direction = EDataDirection.Input
-                        idef_process.get_container('IMAGER').value = imagametadata.imager
-                        idef_process.get_container('IMAGER').data_direction = EDataDirection.Input
-                elif (idef_process.get_container('RAWIMAGELEFT').data_direction == EDataDirection.Output
-                      and idef_process.get_container('RAWIMAGERIGHT').data_direction == EDataDirection.Output):
-
-                    lqn = idef_process.controller_name + '_LEFT'
-                    rqn = idef_process.controller_name + '_RIGHT'
-
-                    "if either queue is empty NOTHING HAPPENS"
-
-                    if len(IDEFProcess.ImageQueues[lqn]) == 0 or len(IDEFProcess.ImageQueues[rqn]) == 0:
-                        continue;
-                    leftimage, leftimagametadata = IDEFProcess.ImageQueues[lqn][0]  # peek at leftmost item
-                    rightimage, rightimagemetadata = IDEFProcess.ImageQueues[rqn][0]  # peek at leftmost item
-
-                    "the oldest image WILL ALWAYS be consumed"
-                    leftyoungest = leftimagametadata.timestamp >= rightimagemetadata.timestamp
-                    if leftyoungest:
-                        rightimage, rightimagemetadata = IDEFProcess.ImageQueues[rqn].pop()
-                    else:
-                        leftimage, leftimagametadata = IDEFProcess.ImageQueues[lqn].pop()
-
-                    tdelta = (leftimagametadata.timestamp - rightimagemetadata.timestamp).total_seconds()
-                    IDEFProcess.Jitter = abs(int(tdelta * 1000))
-                    if IDEFProcess.Jitter > 1000:
-                        print('resync L={},R={}'.format(len(IDEFProcess.ImageQueues[lqn]),
-                                                        len(IDEFProcess.ImageQueues[rqn])))
-                        IDEFProcess.ImageQueues[lqn].clear()
-                        IDEFProcess.ImageQueues[rqn].clear()
-                        continue
-
-                    if IDEFProcess.Jitter > 800:
-                        # if not self.controller.master_control.trigger:
-                        continue
-                    "the youngest image WILL ONLY be consumed if this is under the jitter limit"
-                    if leftyoungest:
-                        leftimage, leftimagametadata = IDEFProcess.ImageQueues[lqn].pop()
-                    else:
-                        rightimage, rightimagemetadata = IDEFProcess.ImageQueues[rqn].pop()
-
-                    if True:
-                        idef_process.get_container('RAWIMAGELEFT').matrix = leftimage
-                        idef_process.get_container('RAWIMAGERIGHT').matrix = rightimage
-                        idef_process.get_container('RAWIMAGELEFT').data_direction = EDataDirection.Input
-                        idef_process.get_container('RAWIMAGERIGHT').data_direction = EDataDirection.Input
-                        idef_process.get_container('LEFTIMAGER').value = leftimagametadata.imager
-                        idef_process.get_container('RIGHTIMAGER').value = rightimagemetadata.imager
-                        idef_process.get_container('LEFTIMAGER').data_direction = EDataDirection.Input
-                        idef_process.get_container('RIGHTIMAGER').data_direction = EDataDirection.Input
-
+                # print('Dispatching process '.format(name))
                 idef_process.process()
                 if idef_process.completed:
                     print('deleting process {}'.format(name))
                     del IDEFProcess.ActiveProcesses[name]
-                break
-            IDEFProcess.DataReady.clear()
-            IDEFProcess.DataReady.wait()
+                    break
+
     @staticmethod
     def serialize_matrix_to_json(m):
         cm = []
@@ -178,6 +112,7 @@ class IDEFProcess(ABC):
             for j in range(m.shape[1]):
                 cm.append(m.item((i, j)))
         return cm
+
     def __init__(self, name):
         self.name = name
 
@@ -187,23 +122,30 @@ class IDEFProcess(ABC):
         self.locals = {}
         self.parent = None
         self.stages = {}
+        self.tape = []
         self.completed = False
         self.status_message = None
         self.targetImager = None
         self.processLock = Lock()
+        self.live_image_transfer = True
 
-    def initialize(self,kvp):
+    def initialize(self, kvp):
         self.create_stages()
         self.allocate_containers()
         self.bind_containers()
         self.initialize_containers()
-        for n,v in kvp.items():
+        for n, v in kvp.items():
             c = self.get_container(n)
             if c.get_container_type() == EContainerType.SCALARCONTAINER:
-                c.value = v;
+                c.value = v
             elif c.get_container_type() == EContainerType.MATRIXCONTAINER:
-                c.matrix = v;
+                c.matrix = v
 
+    def add_stages(self, stages):
+        for i, s in enumerate(stages):
+            self.stages[s.container_name] = s
+            self.tape.append(s)
+            s.process_index = i
 
     def send_status_message(self, text):
         """
@@ -284,7 +226,8 @@ class IDEFProcess(ABC):
         """
         try:
             if not self.completed:
-                for key, aStage in self.stages.items():
+                for aStage in self.tape:
+                    # print('testing stage {}'.format(aStage.container_name))
                     if aStage.is_ready_to_run():
                         # print('dispatching stage {}'.format(aStage.container_name))
                         aStage.process()
@@ -332,6 +275,87 @@ class IDEFProcess(ABC):
                 aStage.bind_container(aBinding.connection, dc)
             aStage.initialize_container_impedance()
 
+    def record_stereo_images(self, controller_name, iid, left, right):
+        if left is not None:
+            self.record_stereo_image(controller_name, left, iid, 'L')
+        if right is not None:
+            self.record_stereo_image(controller_name, right, iid, 'R')
+        return iid
+
+    @staticmethod
+    def stereo_session_image_folder():
+        return "../CalibrationRecords/StereoImages"
+
+    @staticmethod
+    def extract_training_dictionary():
+        td = {}
+        files = [i for i in os.listdir("../CalibrationRecords/StereoImages") if i.endswith("jpg")]
+        for f in files:
+            fnc = f.split('_')
+            key = fnc[0]
+            ctlr = fnc[1]
+            cam = fnc[2][0]
+            camindex = 0 if cam == 'L' else 1
+            if key in td:
+                ia = td[key]
+                if ia[camindex] is True:
+                    print('{} has a duplicate'.format(key))
+                else:
+                    ia[camindex] = True
+            else:
+                ia = [False, False]
+                ia[camindex] = True
+                td[key] = ia
+        return td
+
+    @staticmethod
+    def extract_training_stereo_pairs(td):
+        result = []
+        for k, v in td.items():
+            if v[0] and v[1]:
+                result.append(k)
+        return result
+
+    @staticmethod
+    def extract_training_singles(td, isLeft):
+        result = []
+        tidx = 0 if isLeft else 1
+        fidx = 1 if isLeft else 0
+        for k, v in td.items():
+            if v[tidx] and not v[fidx]:
+                result.append(k)
+        return result
+
+    @staticmethod
+    def stereo_sessionfolder():
+        return "../CalibrationRecords/StereoSessions"
+
+    @staticmethod
+    def stereo_session_filename(fileid, controller_name, stereoSide):
+        return IDEFProcess.stereo_session_image_folder() + "/{}_{}_{}.jpg".format(fileid,
+                                                                                  controller_name,
+                                                                                  stereoSide)
+
+    @staticmethod
+    def record_stereo_image(controller_name, image, fileid, stereoSide):
+        filename = IDEFProcess.stereo_session_filename(fileid, controller_name, stereoSide)
+        # save the image to a file
+        cv2.imwrite(filename, image, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+
+    @staticmethod
+    def fetch_stereo_image(fileid, controller_name, stereoSide):
+        filename = IDEFProcess.stereo_session_filename(fileid, controller_name, stereoSide)
+        # read the image as a raw byte array
+        with open(filename, 'rb') as f:
+            jpegdata = f.read()
+        return bytearray(jpegdata)
+
+    @staticmethod
+    def fetch_stereo_image_matrix(fileid, controller_name, stereoSide):
+        image = IDEFProcess.fetch_stereo_image(fileid, controller_name, stereoSide)
+        ra = np.asarray(image, dtype="uint8")
+        return cv2.imdecode(ra, cv2.IMREAD_COLOR)
+
 
 class EConnection(Enum):
     Undefined = 0
@@ -352,7 +376,8 @@ class IDEFStageBinding:
 class IDEFStage(ABC):
     def __init__(self, host_process, name):
         """
-
+        nb:  The get_required_containers should not be perceived to imply allocation - it is called whenever the
+        stage specific container list is required
         :param host_process: The process that contains this stage instance
         :type host_process: IDEFProcess
         :param name: The container_name of this stage within the host process scope
@@ -360,6 +385,7 @@ class IDEFStage(ABC):
         """
         self.host_process = host_process
         self.container_name = name
+        self.process_index = None
         self.input_containers = {}
         self.output_containers = {}
         self.control_containers = {}

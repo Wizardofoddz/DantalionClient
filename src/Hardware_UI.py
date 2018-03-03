@@ -1,23 +1,23 @@
 """
 Low level GUI for talking to camera hardware and low level processes
 """
+import io
 import json
+import os
 import threading
 import tkinter as tk
 from datetime import datetime
-import io
 
 import cv2
-import os
-from PIL import ImageTk, Image, ExifTags
+from PIL import ImageTk, Image
 
-import tkinter as tk
-
-import Hardware_UI as UI
 import HardwareAbstractionLayer as HAL
+import Hardware_UI as UI
 from Notification import MacNotifier
 from ProcessAbstractionLayer import IDEFProcess
-from ProcessLibrary import IntrinsicsCalculatorProcess, ImageDifferentialCalculatorProcess, StereoCalculatorProcess
+from ProcessLibrary import ImageDifferentialCalculatorProcess, StereoCalculatorProcess, \
+    ChessboardCaptureProcess, GeneticIntrinsicsCalculatorProcess, StereoIntrinsicsCalculatorProcess
+from TrainingSupport import StereoTrainingSet
 
 
 class MasterControl(tk.Frame):
@@ -70,7 +70,7 @@ class MasterControl(tk.Frame):
 
     @staticmethod
     def _destroy(event):
-        print("destroy")
+        pass
 
     def __init__(self, parent, *args, **kwargs):
         super(MasterControl, self).__init__(parent)
@@ -86,15 +86,17 @@ class MasterControl(tk.Frame):
         self.common_data = None
 
         self.programbuttons = None
-        self.trigger = False;
+        self.trigger = False
         self.stereo_alpha_var = tk.StringVar()
         self.stereo_scale_var = tk.StringVar()
         self.stereo_alpha_var.set('-1')
         self.stereo_alpha_var.trace('w', self.update_stereo_alpha)
         self.stereo_scale_var.set('1')
         self.stereo_scale_var.trace('w', self.update_stereo_scale)
-        self.jitter_var = tk.IntVar()
-        self.jitter_var.set(0)
+
+        self.stereobm_config = {"enabled": 0}
+
+        self.calibrationdata = None
         image = ImageTk.PhotoImage(Image.open("../resources/console.jpg"))
         ctl = tk.Label(self, image=image)
         ctl.image = image
@@ -103,9 +105,9 @@ class MasterControl(tk.Frame):
         self.after(2000, self.open_display)
 
         HAL.Controller.initialize_controllers(self)
-        IDEFProcess.initialize_image_intake(['cancer'])
         IDEFProcess.bind_imager_input_functions(HAL.Controller.Controllers[0].get_left_imager())
         IDEFProcess.bind_imager_input_functions(HAL.Controller.Controllers[0].get_right_imager())
+        IDEFProcess.initialize_image_intake(['cancer'])
         self.process_thread = threading.Thread(target=IDEFProcess.process_dispatcher)
         self.process_thread.daemon = True
         self.process_thread.start()
@@ -118,16 +120,25 @@ class MasterControl(tk.Frame):
         self.left_imager = UI.ImagerPanel(imager_pair, 0)
         self.left_imager.pack(fill=tk.BOTH, expand=tk.YES, side=tk.LEFT)
         self.common_data = tk.Frame(imager_pair, width=15)
-        tk.Label(self.common_data, text="Jitter").pack(side=tk.TOP)
-        tk.Label(self.common_data, textvariable=self.jitter_var).pack(side=tk.TOP)
         self.programbuttons = tk.Frame(self.common_data)
-        tk.Button(self.programbuttons, width=10, text="SterCalib", command=self.start_stereo_calibration).pack(
-            side=tk.TOP)
+
         tk.Button(self.programbuttons, width=10, text="Set Stereo", command=self.set_stereo_calibration).pack(
             side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="Set Depth", command=self.set_depth_analyser).pack(
+            side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="Set MFS", command=self.set_mono_from_stereo_calibration).pack(
+            side=tk.TOP)
+
         tk.Button(self.programbuttons, width=10, text="Trigger", command=self.set_trigger).pack(side=tk.TOP)
         tk.Button(self.programbuttons, width=10, text="Purge Sessions", command=self.purge_sessions).pack(side=tk.TOP)
-        tk.Button(self.programbuttons, width=10, text="Export CSV", command=self.create_calibration_csv).pack(side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="Export CSV", command=self.create_calibration_csv).pack(
+            side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="ChessCap", command=self.capture_chessboards).pack(side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="GenCalib", command=self.start_genetic_calibration).pack(
+            side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="ProcSter", command=self.process_stereo_set).pack(
+            side=tk.TOP)
+
         self.programbuttons.pack()
         tk.Label(self.common_data, text="Alpha").pack(side=tk.TOP)
         tk.Entry(self.common_data, textvariable=self.stereo_alpha_var).pack(side=tk.TOP)
@@ -154,12 +165,15 @@ class MasterControl(tk.Frame):
 
     def update_stereo_alpha(self, a, b, c):
         alpha = float(self.stereo_alpha_var.get())
+        print('alpha {}'.format(alpha))
         HAL.Controller.Controllers[0].publish_message(HAL.Controller.Controllers[0].imagers[0].imager_address,
                                                       'stereo_rectify_alpha', alpha)
+
     def update_stereo_scale(self, a, b, c):
         scale = int(self.stereo_scale_var.get())
         HAL.Controller.Controllers[0].publish_message(HAL.Controller.Controllers[0].imagers[0].imager_address,
                                                       'stereo_rectify_scale', scale)
+
     def stereo_calibration_filename(self):
         """
         Location of precomputed calibration file with camera intrinsics and stereo extrinsics
@@ -169,30 +183,118 @@ class MasterControl(tk.Frame):
         filename = "stereo_{}_0.json".format(HAL.Controller.Controllers[0].resource)
         return "../resources/" + filename
 
+    stereoindex = 0
+
     def set_stereo_calibration(self):
-        filename = self.stereo_calibration_filename()
+        filename = '../CalibrationRecords/StereoIntrinsicCalcs.txt'
         with open(filename, "r") as file:
-            cfg = file.read()
-            HAL.Controller.Controllers[0].publish_message(0, "stereoextrinsics", cfg)
+            x = [l.strip()[:-1] for l in file]
+            x = x[:-1]
+        # HAL.Controller.Controllers[0].publish_message(0, "stereoextrinsics", x[MasterControl.stereoindex])
+        while MasterControl.stereoindex < len(x) and self.get_stereo_score(x[MasterControl.stereoindex]) > 1:
+            MasterControl.stereoindex += 1
+        if MasterControl.stereoindex >= len(x):
+            MasterControl.stereoindex = 0
+            self.change_status_message("REWOUND STEREO CALIBRATION LIST")
+        self.calculate_stereo_rectification(x[MasterControl.stereoindex])
+        MasterControl.stereoindex += 1
 
-    def start_stereo_calibration(self):
-        leftimager = HAL.Controller.Controllers[0].imagers[0]
-        rightimager = HAL.Controller.Controllers[0].imagers[1]
+    def set_depth_analyser(self):
+        x = StereoBMDialog(MasterControl.root)
 
-        icp = StereoCalculatorProcess("SterCalib", leftimager, rightimager)
-        icp.initialize({"RECORDING" : False})
+    def get_stereo_score(self, rec):
+        jd = json.loads(rec)
+        fv = float(jd['Q'])
+        return fv
+
+    def calculate_stereo_rectification(self, rec):
+        jd = json.loads(rec)
+        cml = StereoTrainingSet.resurrect_matrix(jd['CML'])
+        self.change_status_message('Reprojection error = {}'.format(jd['Q']))
+        cdl = StereoTrainingSet.resurrect_matrix(jd['DCL'])
+        cmr = StereoTrainingSet.resurrect_matrix(jd['CMR'])
+        cdr = StereoTrainingSet.resurrect_matrix(jd['DCR'])
+        R = StereoTrainingSet.resurrect_matrix(jd['R'])
+        T = StereoTrainingSet.resurrect_matrix(jd['T'])
+        E = StereoTrainingSet.resurrect_matrix(jd['E'])
+        F = StereoTrainingSet.resurrect_matrix(jd['F'])
+
+        rotation1, rotation2, pose1, pose2 = cv2.stereoRectify(cml,
+                                                               cdl,
+                                                               cmr,
+                                                               cdr,
+                                                               (1280, 1024),
+                                                               R,
+                                                               T,
+                                                               flags=cv2.CALIB_ZERO_DISPARITY,
+                                                               newImageSize=(1280, 1024),
+                                                               alpha=0.0
+                                                               )[0: 4]
+
+        dl = {
+            'CAMERAMATRIX': jd['CML'], 'DISTORTIONCOEFFICIENTS': jd['DCL'],
+            'ROTATION': StereoTrainingSet.flatten_matrix(rotation2),
+            'POSE': StereoTrainingSet.flatten_matrix(pose2)
+        }
+        HAL.Controller.Controllers[0].publish_message(0, "intrinsics", json.dumps(dl, ensure_ascii=False))
+        dl = {
+            'CAMERAMATRIX': jd['CMR'], 'DISTORTIONCOEFFICIENTS': jd['DCR'],
+            'ROTATION': StereoTrainingSet.flatten_matrix(rotation1),
+            'POSE': StereoTrainingSet.flatten_matrix(pose1)
+        }
+        HAL.Controller.Controllers[0].publish_message(1, "intrinsics", json.dumps(dl, ensure_ascii=False))
+
+    @staticmethod
+    def set_mono_from_stereo_calibration():
+        filename = '../CalibrationRecords/StereoIntrinsicCalcs.txt'
+        with open(filename, "r") as file:
+            x = [l.strip()[:-1] for l in file]
+        rec = x[MasterControl.stereoindex]
+        jd = json.loads(rec)
+        dl = {
+            'CAMERAMATRIX': jd['CML'], 'DISTORTIONCOEFFICIENTS': jd['DCL']
+        }
+        HAL.Controller.Controllers[0].publish_message(0, "intrinsics", json.dumps(dl, ensure_ascii=False))
+        dl = {
+            'CAMERAMATRIX': jd['CMR'], 'DISTORTIONCOEFFICIENTS': jd['DCR']
+        }
+        HAL.Controller.Controllers[0].publish_message(1, "intrinsics", json.dumps(dl, ensure_ascii=False))
+
+    def process_stereo_set(self):
+
+        icp = StereoIntrinsicsCalculatorProcess("ProcSter", HAL.Controller.Controllers[0].imagers[0],
+                                                HAL.Controller.Controllers[0].imagers[1])
+        icp.initialize({"RECORDING": False})
         icp.status_message = self.change_status_message
         IDEFProcess.add_process(icp)
 
+    def capture_chessboards(self):
+        leftimager = HAL.Controller.Controllers[0].imagers[0]
+        rightimager = HAL.Controller.Controllers[0].imagers[1]
+
+        icp = ChessboardCaptureProcess("ChessCap", leftimager, rightimager)
+        icp.initialize({})
+        icp.status_message = self.change_status_message
+        IDEFProcess.add_process(icp)
+
+    def start_genetic_calibration(self):
+        # we want undistorted
+        # if 'UNDISTORT' not in self.get_imager().controller.imagers[self.get_imager().imager_address].processes:
+
+        icp = GeneticIntrinsicsCalculatorProcess('GeneticIntrinsicsCalculatorProcess', True,
+                                                 HAL.Controller.Controllers[0].imagers[0],
+                                                 HAL.Controller.Controllers[0].imagers[1])
+        icp.initialize({})
+        icp.status_message = self.change_status_message
+        IDEFProcess.ActiveProcesses['GenCalib'] = icp
+
     def update_status_display(self):
-        self.jitter_var.set(IDEFProcess.Jitter)
         for name, button in self.programbuttons.children.items():
             label = button['text']
             if label in IDEFProcess.ActiveProcesses:
                 button.configure(highlightbackground='blue')
             else:
                 button.configure(highlightbackground='green')
-        self.update()
         self.after(2000, self.update_status_display)
 
     def change_status_message(self, text):
@@ -205,33 +307,41 @@ class MasterControl(tk.Frame):
         """
         self.status_line.config(text=text)
 
-    def create_calibration_csv(self):
-        with open('../CalibrationRecords/intrinsicsHistory.txt', 'r') as myfile:
+    @staticmethod
+    def create_calibration_csv():
+        with open('../CalibrationRecords/GeneticIntrinsicsHistory.txt', 'r') as myfile:
             data = '[' + myfile.read() + ']'
         jd = json.loads(data)
-        with open('../CalibrationRecords/intrinsicsHistory.csv', 'w') as myfile:
+        with open('../CalibrationRecords/GeneticIntrinsicsHistory.csv', 'w') as myfile:
             for x in jd:
-                p1 = '{},{},{},{},{},{},{}'.format(x['ID'],x['TIMESTAMP'],x['CONTROLLER'],x['CAMERAINDEX'],
-                                       x['MATCHCOUNT'],x['MATCHSEPARATION'],x['REPROJECTIONERROR'])
+                p1 = '{},{},{},{},{},{},{}'.format(x['ID'], x['TIMESTAMP'], x['CONTROLLER'], x['CAMERAINDEX'],
+                                                   x['MATCHCOUNT'], x['MATCHSEPARATION'], x['REPROJECTIONERROR'])
                 cmstr = ''
-                for i in range(0,9):
+                for i in range(0, 9):
                     if i != 0:
                         cmstr += ','
                     cmstr += str(x['CAMERAMATRIX'][2 + i])
 
                 dsstr = ''
-                for i in range(0,5):
+                for i in range(0, 5):
                     if i != 0:
                         dsstr += ','
                     dsstr += str(x['DISTORTIONCOEFFICIENTS'][2 + i])
-                line = p1 + ',' + cmstr + ',' + dsstr + '\n'
+
+                datasetstr = ''
+                try:
+                    ds = x['DATASET']
+                    for i in ds:
+                        if i != 0:
+                            datasetstr += ','
+                        datasetstr += i
+                except:
+                    pass
+                line = p1 + ',' + cmstr + ',' + dsstr + ',' + datasetstr + '\n'
                 myfile.write(line)
 
+
 class ImagerPanel(tk.Frame):
-    @staticmethod
-    def image_click(event):
-        # event.widget.get_imager().toggle_camera()
-        print('livk')
 
     def get_imager(self):
         return HAL.Controller.Controllers[0].imagers[self.image_index.get()]
@@ -244,7 +354,12 @@ class ImagerPanel(tk.Frame):
 
         "top row that carries info"
         toprow = tk.Frame(self)
-        tk.Label(toprow,text = "Ctlr: {} ".format(self.get_imager().controller.resource)).pack(side=tk.LEFT)
+        self.show_live_images = tk.IntVar()
+        # self.show_live_images.trace('r',)
+        chk = tk.Checkbutton(self, text="Live", variable=self.show_live_images)
+        chk.pack(side=tk.LEFT, expand=tk.NO)
+
+        tk.Label(toprow, text="Ctlr: {} ".format(self.get_imager().controller.resource)).pack(side=tk.LEFT)
         tk.Radiobutton(toprow,
                        text="LEFT",
                        width=7,
@@ -277,15 +392,13 @@ class ImagerPanel(tk.Frame):
         centerrow = tk.Frame(self)
         leftcol = tk.Frame(centerrow)
         self.programbuttons = tk.Frame(leftcol)
-        tk.Button(self.programbuttons, width=10, text="Calibrate", command=self.start_calibration).pack(side=tk.TOP)
-        tk.Button(self.programbuttons, width=10, text="Uncalibr", command=self.stop_calibration).pack(side=tk.TOP)
         tk.Button(self.programbuttons, width=10, text="Diff", command=self.start_differential).pack(side=tk.TOP)
         tk.Button(self.programbuttons, width=10, text="Reset FPS", command=self.get_imager().reset_fps_samples).pack(
             side=tk.TOP)
         self.programbuttons.pack(side=tk.TOP)
         df = tk.Frame(leftcol)
         tk.Label(df, text="#SAM").pack(side=tk.LEFT)
-        tk.Entry(df,width=5, textvariable=self.num_calibration_samples).pack(side=tk.LEFT)
+        tk.Entry(df, width=5, textvariable=self.num_calibration_samples).pack(side=tk.LEFT)
         df.pack(side=tk.TOP)
         leftcol.pack(side=tk.LEFT)
 
@@ -360,8 +473,8 @@ class ImagerPanel(tk.Frame):
         ebutton = tk.Menubutton(host_menu, text=function_name, underline=0)
         ebutton.pack(side=tk.TOP)
         edit = tk.Menu(ebutton, tearoff=0)
-        for mtext, cval in menu_items:
-            edit.add_command(label=mtext, command=lambda cval=cval: self.set_camera_control(control_name, cval),
+        for mtext, control in menu_items:
+            edit.add_command(label=mtext, command=lambda cval=control: self.set_camera_control(control_name, cval),
                              underline=0)
         ebutton.config(menu=edit)
         return ebutton
@@ -383,17 +496,6 @@ class ImagerPanel(tk.Frame):
         if self.get_imager().last_time is not None:
             self.get_imager().framerate_sum += (now - self.get_imager().last_time)
         self.get_imager().last_time = now
-
-    def start_calibration(self):
-        # we want undistorted
-        # if 'UNDISTORT' not in self.get_imager().controller.imagers[self.get_imager().imager_address].processes:
-        icp = IntrinsicsCalculatorProcess('IntrinsicsCalculatorProcess', self.get_imager())
-        icp.initialize({'MATCHCOUNT': int(self.num_calibration_samples.get())})
-        icp.status_message = self.change_status_message
-        IDEFProcess.ActiveProcesses['Calibrate'] = icp
-
-    def stop_calibration(self):
-        self.get_imager().controller.publish_message(self.get_imager().imager_address, "intrinsics", None)
 
     def get_calibration(self):
         return self.get_imager().get_calibration()
@@ -418,7 +520,7 @@ class ImagerPanel(tk.Frame):
         :return:
         :rtype:
         """
-        self.update_imager_status_display(0)
+        self.update_imager_status_display()
         self.after(1000, self.status_update)
 
     def capture_update(self):
@@ -445,6 +547,11 @@ class ImagerPanel(tk.Frame):
                 self.imager_display.itemconfigure(self.imager_display.image_id, image=self.imager_display.image)
 
             self.imager_display.configure(scrollregion=self.imager_display.bbox("all"))
+            hspace = 60
+            for i in range(0, self.imager_display.winfo_height(), hspace):
+                self.imager_display.create_line(0, i, self.imager_display.winfo_width(), i,
+                                                fill="red")
+            self.update()
         except:
             pass
         finally:
@@ -460,11 +567,9 @@ class ImagerPanel(tk.Frame):
         """
         self.status_line.config(text=text)
 
-    def update_imager_status_display(self, imager_ordinal):
+    def update_imager_status_display(self):
         """ IFF there is an available image, show it in the imager display
 
-        :param imager_ordinal: identifies the controller
-        :type imager_ordinal: int
         """
 
         if self.get_imager().framerate_sum.total_seconds() == 0:
@@ -486,3 +591,172 @@ class ImagerPanel(tk.Frame):
                 button.configure(highlightbackground='blue')
             else:
                 button.configure(highlightbackground='green')
+
+
+class BasicDialog(tk.Toplevel):
+
+    def __init__(self, parent, title=None):
+
+        tk.Toplevel.__init__(self, parent)
+        self.transient(parent)
+
+        if title:
+            self.title(title)
+
+        self.parent = parent
+
+        self.result = None
+
+        body = tk.Frame(self)
+        self.initial_focus = self.body(body)
+        body.pack(padx=5, pady=5)
+
+        self.buttonbox()
+
+        self.grab_set()
+
+        if not self.initial_focus:
+            self.initial_focus = self
+
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        self.geometry("+%d+%d" % (parent.winfo_rootx() + 50,
+                                  parent.winfo_rooty() + 50))
+
+        self.initial_focus.focus_set()
+
+        self.wait_window(self)
+
+    #
+    # construction hooks
+
+    def body(self, master):
+        # create dialog body.  return widget that should have
+        # initial focus.  this method should be overridden
+
+        pass
+
+    def buttonbox(self):
+        # add standard button box. override if you don't want the
+        # standard buttons
+
+        box = tk.Frame(self)
+
+        w = tk.Button(box, text="OK", width=10, command=self.ok, default=tk.ACTIVE)
+        w.pack(side=tk.LEFT, padx=5, pady=5)
+        w = tk.Button(box, text="Cancel", width=10, command=self.cancel)
+        w.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.bind("<Return>", self.ok)
+        self.bind("<Escape>", self.cancel)
+
+        box.pack()
+
+    #
+    # standard button semantics
+
+    def ok(self, event=None):
+
+        if not self.validate():
+            self.initial_focus.focus_set()  # put focus back
+            return
+
+        self.withdraw()
+        self.update_idletasks()
+
+        self.apply()
+
+        self.cancel()
+
+    def cancel(self, event=None):
+
+        # put focus back to the parent window
+        self.parent.focus_set()
+        self.destroy()
+
+    #
+    # command hooks
+
+    def validate(self):
+
+        return 1  # override
+
+    def apply(self):
+
+        pass  # override
+
+
+class StereoBMDialog(BasicDialog):
+
+    def body(self, master):
+        tk.Label(master, text="blockSize:").grid(row=0, column=0)
+        tk.Label(master, text="disp12MaxDiff:").grid(row=1, column=0)
+        tk.Label(master, text="minDisparity:").grid(row=2, column=0)
+        tk.Label(master, text="numDisparities:").grid(row=3, column=0)
+        tk.Label(master, text="preFilterCap:").grid(row=4, column=0)
+        tk.Label(master, text="preFilterSize:").grid(row=5, column=0)
+        tk.Label(master, text="preFilterType:").grid(row=6, column=0)
+        tk.Label(master, text="smallerBlockSize:").grid(row=7, column=0)
+        tk.Label(master, text="speckleRange:").grid(row=8, column=0)
+        tk.Label(master, text="speckleWindowSize:").grid(row=9, column=0)
+        tk.Label(master, text="textureThreshold:").grid(row=10, column=0)
+        tk.Label(master, text="uniquenessRatio:").grid(row=11, column=0)
+
+        self.blockSize = tk.Entry(master)
+        self.disp12MaxDiff = tk.Entry(master)
+        self.minDisparity = tk.Entry(master)
+        self.numDisparities = tk.Entry(master)
+        self.preFilterCap = tk.Entry(master)
+        self.preFilterSize = tk.Entry(master)
+        self.preFilterType = tk.Entry(master)
+        self.smallerBlockSize = tk.Entry(master)
+        self.speckleRange = tk.Entry(master)
+        self.speckleWindowSize = tk.Entry(master)
+        self.textureThreshold = tk.Entry(master)
+        self.uniquenessRatio = tk.Entry(master)
+
+        self.blockSize.grid(row=0, column=1)
+        self.disp12MaxDiff.grid(row=1, column=1)
+        self.minDisparity.grid(row=2, column=1)
+        self.numDisparities.grid(row=3, column=1)
+        self.preFilterCap.grid(row=4, column=1)
+        self.preFilterSize.grid(row=5, column=1)
+        self.preFilterType.grid(row=6, column=1)
+        self.smallerBlockSize.grid(row=7, column=1)
+        self.speckleRange.grid(row=8, column=1)
+        self.speckleWindowSize.grid(row=9, column=1)
+        self.textureThreshold.grid(row=10, column=1)
+        self.uniquenessRatio.grid(row=11, column=1)
+        return self.blockSize  # initial focus
+
+    def apply(self):
+        stereobm_config = {}
+        stereobm_config["enabled"] = 1
+        if len(self.blockSize.get()) > 0:
+            stereobm_config["blockSize"] = int(self.blockSize.get())
+        if len(self.disp12MaxDiff.get()) > 0:
+            stereobm_config["disp12MaxDiff"] = int(self.disp12MaxDiff.get())
+        if len(self.minDisparity.get()) > 0:
+            stereobm_config["minDisparity"] = int(self.minDisparity.get())
+        if len(self.numDisparities.get()) > 0:
+            stereobm_config["numDisparities"] = int(self.numDisparities.get())
+        if len(self.preFilterCap.get()) > 0:
+            stereobm_config["preFilterCap"] = int(self.preFilterCap.get())
+        if len(self.preFilterSize.get()) > 0:
+            stereobm_config["preFilterSize"] = int(self.preFilterSize.get())
+        if len(self.preFilterType.get()) > 0:
+            stereobm_config["preFilterType"] = int(self.preFilterType.get())
+        if len(self.smallerBlockSize.get()) > 0:
+            stereobm_config["smallerBlockSize"] = int(self.smallerBlockSize.get())
+        if len(self.speckleRange.get()) > 0:
+            stereobm_config["speckleRange"] = int(self.speckleRange.get())
+        if len(self.speckleWindowSize.get()) > 0:
+            stereobm_config["speckleWindowSize"] = int(self.speckleWindowSize.get())
+        if len(self.textureThreshold.get()) > 0:
+            stereobm_config["textureThreshold"] = int(self.textureThreshold.get())
+        if len(self.uniquenessRatio.get()) > 0:
+            stereobm_config["uniquenessRatio"] = int(self.uniquenessRatio.get())
+        HAL.Controller.Controllers[0].publish_message(0, "depthmapper",
+                                                      json.dumps(stereobm_config, ensure_ascii=False))
+
+        stereobm_config
