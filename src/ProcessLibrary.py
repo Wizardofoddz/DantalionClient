@@ -649,7 +649,7 @@ class GeneticIntrinsicsCalculatorProcess(IDEFProcess):
         self.locals[sc.name] = sc
 
         sc = self.get_container('POPULATIONLIMIT')
-        sc.value = 36
+        sc.value = 100
         sc.data_direction = EDataDirection.Input
         self.locals[sc.name] = sc
 
@@ -787,7 +787,7 @@ class StereoIntrinsicsCalculatorProcess(IDEFProcess):
         if StereoTrainingSet.data_ready(False):
             sts = StereoTrainingSet(True)
             sts.load_training_results()
-            td = sts.extract_population(99999)
+            td = sts.extract_population(250)
             sc = self.get_container('STEREOTRAININGSET')
             sc.value = td
             sc.data_direction = EDataDirection.Input

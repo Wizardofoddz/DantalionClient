@@ -2,7 +2,58 @@ import json
 import math
 import os
 
+import cv2
 import numpy as np
+
+from ProcessAbstractionLayer import IDEFProcess
+
+
+class ImageGene:
+    @staticmethod
+    def initialze():
+        ImageGene.GeneDictionary = IDEFProcess.extract_training_dictionary()
+        ImageGene.StereoPairs = IDEFProcess.extract_training_stereo_pairs(ImageGene.GeneDictionary)
+        ImageGene.GeneColors = {}
+        max = 0
+        min = 9999
+        for k in ImageGene.StereoPairs:
+            lib = ImageGene.analyze_image_blur(ImageGene.imagefile(k, True))
+            rib = ImageGene.analyze_image_blur(ImageGene.imagefile(k, False))
+            v = (lib + rib) / 2.0
+            if v > max:
+                max = v
+            elif v < min:
+                min = v
+
+            ImageGene.GeneColors[k] = v
+        ctr = 0
+        for k, v in ImageGene.GeneColors.items():
+            c1 = int(ctr / 26)
+            c2 = int(ctr % 26)
+            ctr += 1
+            c1 = chr(ord('a') + c1)
+            c2 = chr(ord('a') + c2)
+            v = ImageGene.GeneColors[k]
+            vn = (v - min) / (max - min)
+            v1 = [int(vn * 255), 0, 0, c1 + c2]
+            ImageGene.GeneColors[k] = v1
+
+    @staticmethod
+    def imagefile(key, isLeft):
+        fnd = "L" if isLeft else "R"
+        return IDEFProcess.stereo_session_image_folder() + "/" + key + "_unknownctlr_" + fnd + ".jpg"
+
+    @staticmethod
+    def analyze_image_blur(imagefile):
+        image = cv2.imread(imagefile)
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # compute the Laplacian of the image and then return the focus
+        # measure, which is simply the variance of the Laplacian
+        return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+    GeneDictionary = None
+    GeneColors = None
 
 
 class StereoTrainingChromosome:
@@ -97,7 +148,7 @@ class StereoTrainingSet:
                 d.right_reprojerr = x['REPROJECTIONERROR']
                 for i, td in enumerate(x['DATASET']):
                     if d.chromosome[i] != td:
-                        raise ValueError('Right hromosome mismatch error')
+                        raise ValueError('Right chromosome mismatch error')
         # order by inreasing 2d reprojection error
         vals = list(training_set.values())
         vals.sort(key=lambda a: a.combined_reprojection_error())

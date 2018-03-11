@@ -6,6 +6,7 @@ import json
 import os
 import threading
 import tkinter as tk
+import uuid
 from datetime import datetime
 
 import cv2
@@ -13,6 +14,7 @@ from PIL import ImageTk, Image
 
 import HardwareAbstractionLayer as HAL
 import Hardware_UI as UI
+from FrontPanels import EvolutionMonitorPanel
 from Notification import MacNotifier
 from ProcessAbstractionLayer import IDEFProcess
 from ProcessLibrary import ImageDifferentialCalculatorProcess, StereoCalculatorProcess, \
@@ -124,11 +126,18 @@ class MasterControl(tk.Frame):
 
         tk.Button(self.programbuttons, width=10, text="Set Stereo", command=self.set_stereo_calibration).pack(
             side=tk.TOP)
-        tk.Button(self.programbuttons, width=10, text="Set Depth", command=self.set_depth_analyser).pack(
-            side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="Set Depth", command=self.set_depth_analyser).pack(side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="Save Config", command=self.save_config).pack(side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="Load Config", command=self.load_config).pack(side=tk.TOP)
         tk.Button(self.programbuttons, width=10, text="Set MFS", command=self.set_mono_from_stereo_calibration).pack(
             side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="Inspect", command=self.inspect_stereo_images).pack(
+            side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="Save Images", command=self.save_off_images).pack(
+            side=tk.TOP)
 
+        tk.Button(self.programbuttons, width=10, text="EvoMon", command=self.evolution_monitor).pack(
+            side=tk.TOP)
         tk.Button(self.programbuttons, width=10, text="Trigger", command=self.set_trigger).pack(side=tk.TOP)
         tk.Button(self.programbuttons, width=10, text="Purge Sessions", command=self.purge_sessions).pack(side=tk.TOP)
         tk.Button(self.programbuttons, width=10, text="Export CSV", command=self.create_calibration_csv).pack(
@@ -136,8 +145,7 @@ class MasterControl(tk.Frame):
         tk.Button(self.programbuttons, width=10, text="ChessCap", command=self.capture_chessboards).pack(side=tk.TOP)
         tk.Button(self.programbuttons, width=10, text="GenCalib", command=self.start_genetic_calibration).pack(
             side=tk.TOP)
-        tk.Button(self.programbuttons, width=10, text="ProcSter", command=self.process_stereo_set).pack(
-            side=tk.TOP)
+        tk.Button(self.programbuttons, width=10, text="ProcSter", command=self.process_stereo_set).pack(side=tk.TOP)
 
         self.programbuttons.pack()
         tk.Label(self.common_data, text="Alpha").pack(side=tk.TOP)
@@ -149,9 +157,9 @@ class MasterControl(tk.Frame):
         self.right_imager.pack(fill=tk.BOTH, expand=tk.YES, side=tk.RIGHT)
         imager_pair.pack(fill=tk.BOTH, expand=tk.YES, side=tk.TOP)
         bottomrow = tk.Frame(self)
-        self.status_line = tk.Label(bottomrow, text="Main Message Display")
-        self.status_line.pack(side=tk.LEFT)
-        bottomrow.pack(side=tk.TOP)
+        self.status_line = tk.Label(bottomrow, text="Main Message Display", anchor="w")
+        self.status_line.pack(side=tk.LEFT, fill=tk.X)
+        bottomrow.pack(side=tk.TOP, fill=tk.X)
         self.update_status_display()
 
     def set_trigger(self):
@@ -173,6 +181,17 @@ class MasterControl(tk.Frame):
         scale = int(self.stereo_scale_var.get())
         HAL.Controller.Controllers[0].publish_message(HAL.Controller.Controllers[0].imagers[0].imager_address,
                                                       'stereo_rectify_scale', scale)
+
+    def save_off_images(self):
+        fnp = '../CalibrationRecords/ImageBundles/{}_{}_{}.jpg'
+        groupid = uuid.uuid4().hex
+        for k, v in HAL.Controller.Controllers[0].imagers[0].cv2_image_array.items():
+            fn = fnp.format(groupid, k, "left")
+            cv2.imwrite(fn, v)
+
+        for k, v in HAL.Controller.Controllers[0].imagers[1].cv2_image_array.items():
+            fn = fnp.format(groupid, k, "right")
+            cv2.imwrite(fn, v)
 
     def stereo_calibration_filename(self):
         """
@@ -201,6 +220,18 @@ class MasterControl(tk.Frame):
 
     def set_depth_analyser(self):
         x = StereoBMDialog(MasterControl.root)
+
+    def inspect_stereo_images(self):
+        x = ImageInspector()
+
+    def evolution_monitor(self):
+        x = EvolutionMonitorPanel()
+
+    def save_config(self):
+        HAL.Controller.Controllers[0].publish_message(0, "saveconfig", "filename")
+
+    def load_config(self):
+        HAL.Controller.Controllers[0].publish_message(0, "loadconfig", "filename")
 
     def get_stereo_score(self, rec):
         jd = json.loads(rec)
@@ -233,15 +264,17 @@ class MasterControl(tk.Frame):
 
         dl = {
             'CAMERAMATRIX': jd['CML'], 'DISTORTIONCOEFFICIENTS': jd['DCL'],
-            'ROTATION': StereoTrainingSet.flatten_matrix(rotation2),
-            'POSE': StereoTrainingSet.flatten_matrix(pose2)
-        }
-        HAL.Controller.Controllers[0].publish_message(0, "intrinsics", json.dumps(dl, ensure_ascii=False))
-        dl = {
-            'CAMERAMATRIX': jd['CMR'], 'DISTORTIONCOEFFICIENTS': jd['DCR'],
             'ROTATION': StereoTrainingSet.flatten_matrix(rotation1),
             'POSE': StereoTrainingSet.flatten_matrix(pose1)
         }
+        print(pose1)
+        HAL.Controller.Controllers[0].publish_message(0, "intrinsics", json.dumps(dl, ensure_ascii=False))
+        dl = {
+            'CAMERAMATRIX': jd['CMR'], 'DISTORTIONCOEFFICIENTS': jd['DCR'],
+            'ROTATION': StereoTrainingSet.flatten_matrix(rotation2),
+            'POSE': StereoTrainingSet.flatten_matrix(pose2)
+        }
+        print(pose2)
         HAL.Controller.Controllers[0].publish_message(1, "intrinsics", json.dumps(dl, ensure_ascii=False))
 
     @staticmethod
@@ -355,7 +388,7 @@ class ImagerPanel(tk.Frame):
         "top row that carries info"
         toprow = tk.Frame(self)
         self.show_live_images = tk.IntVar()
-        # self.show_live_images.trace('r',)
+        self.show_live_images.trace('w', self.video_enable)
         chk = tk.Checkbutton(self, text="Live", variable=self.show_live_images)
         chk.pack(side=tk.LEFT, expand=tk.NO)
 
@@ -428,9 +461,15 @@ class ImagerPanel(tk.Frame):
         bottomrow = tk.Frame(self)
         self.status_line = tk.Label(bottomrow, text="Imager Message Display")
         self.status_line.pack(side=tk.LEFT)
+        tk.Label(bottomrow, text="Blur: ").pack(side=tk.LEFT)
+        self.blur = tk.Label(bottomrow, text="0.0")
+        self.blur.pack(side=tk.LEFT)
         bottomrow.pack(side=tk.TOP)
         self.status_update()
         self.capture_update()
+
+    def video_enable(self, a, b, c):
+        self.get_imager().video_enabled = not self.get_imager().video_enabled
 
     def build_control_buttons(self):
         """
@@ -540,6 +579,12 @@ class ImagerPanel(tk.Frame):
                 return
 
             self.imager_display.image = ImageTk.PhotoImage(Image.open(io.BytesIO(rawimage)))
+
+            image = self.get_imager().get_image(self.selected_imager_channel.get(), True)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            # compute the Laplacian of the image and then return the focus
+            # measure, which is simply the variance of the Laplacian
+            # self.blur.config(text=str(cv2.Laplacian(gray, cv2.CV_64F).var()))
             if self.imager_display.image_id is None:
                 self.imager_display.image_id = self.imager_display.create_image(0, 0, image=self.imager_display.image,
                                                                                 anchor='nw')
@@ -689,74 +734,148 @@ class BasicDialog(tk.Toplevel):
 class StereoBMDialog(BasicDialog):
 
     def body(self, master):
-        tk.Label(master, text="blockSize:").grid(row=0, column=0)
-        tk.Label(master, text="disp12MaxDiff:").grid(row=1, column=0)
-        tk.Label(master, text="minDisparity:").grid(row=2, column=0)
-        tk.Label(master, text="numDisparities:").grid(row=3, column=0)
-        tk.Label(master, text="preFilterCap:").grid(row=4, column=0)
-        tk.Label(master, text="preFilterSize:").grid(row=5, column=0)
-        tk.Label(master, text="preFilterType:").grid(row=6, column=0)
-        tk.Label(master, text="smallerBlockSize:").grid(row=7, column=0)
-        tk.Label(master, text="speckleRange:").grid(row=8, column=0)
-        tk.Label(master, text="speckleWindowSize:").grid(row=9, column=0)
-        tk.Label(master, text="textureThreshold:").grid(row=10, column=0)
-        tk.Label(master, text="uniquenessRatio:").grid(row=11, column=0)
+        coeff = HAL.Controller.Controllers[0].stereomapper_coefficients
 
-        self.blockSize = tk.Entry(master)
-        self.disp12MaxDiff = tk.Entry(master)
-        self.minDisparity = tk.Entry(master)
-        self.numDisparities = tk.Entry(master)
-        self.preFilterCap = tk.Entry(master)
-        self.preFilterSize = tk.Entry(master)
-        self.preFilterType = tk.Entry(master)
-        self.smallerBlockSize = tk.Entry(master)
-        self.speckleRange = tk.Entry(master)
-        self.speckleWindowSize = tk.Entry(master)
-        self.textureThreshold = tk.Entry(master)
-        self.uniquenessRatio = tk.Entry(master)
+        self.labels = [
+            "enabled", "blockSize", "disp12MaxDiff", "minDisparity", "numDisparities", "preFilterCap",
+            "preFilterSize",
+            "preFilterType", "smallerBlockSize", "speckleRange", "speckleWindowSize",
+            "textureThreshold", "uniquenessRatio"]
+        self.labelTitles = {}
+        self.entryFields = {}
+        row = 0
+        for l in self.labels:
+            t = l + ":"
+            self.labelTitles[l] = tk.Label(master, text=t).grid(row=row, column=0)
+            self.entryFields[l] = tk.Entry(master)
+            if coeff is not None and l in coeff:
+                self.entryFields[l].delete(0, tk.END)
+                self.entryFields[l].insert(0, coeff[l])
+            self.entryFields[l].grid(row=row, column=1)
+            row += 1
 
-        self.blockSize.grid(row=0, column=1)
-        self.disp12MaxDiff.grid(row=1, column=1)
-        self.minDisparity.grid(row=2, column=1)
-        self.numDisparities.grid(row=3, column=1)
-        self.preFilterCap.grid(row=4, column=1)
-        self.preFilterSize.grid(row=5, column=1)
-        self.preFilterType.grid(row=6, column=1)
-        self.smallerBlockSize.grid(row=7, column=1)
-        self.speckleRange.grid(row=8, column=1)
-        self.speckleWindowSize.grid(row=9, column=1)
-        self.textureThreshold.grid(row=10, column=1)
-        self.uniquenessRatio.grid(row=11, column=1)
-        return self.blockSize  # initial focus
+        return self.entryFields["blockSize"]  # initial focus
 
     def apply(self):
         stereobm_config = {}
-        stereobm_config["enabled"] = 1
-        if len(self.blockSize.get()) > 0:
-            stereobm_config["blockSize"] = int(self.blockSize.get())
-        if len(self.disp12MaxDiff.get()) > 0:
-            stereobm_config["disp12MaxDiff"] = int(self.disp12MaxDiff.get())
-        if len(self.minDisparity.get()) > 0:
-            stereobm_config["minDisparity"] = int(self.minDisparity.get())
-        if len(self.numDisparities.get()) > 0:
-            stereobm_config["numDisparities"] = int(self.numDisparities.get())
-        if len(self.preFilterCap.get()) > 0:
-            stereobm_config["preFilterCap"] = int(self.preFilterCap.get())
-        if len(self.preFilterSize.get()) > 0:
-            stereobm_config["preFilterSize"] = int(self.preFilterSize.get())
-        if len(self.preFilterType.get()) > 0:
-            stereobm_config["preFilterType"] = int(self.preFilterType.get())
-        if len(self.smallerBlockSize.get()) > 0:
-            stereobm_config["smallerBlockSize"] = int(self.smallerBlockSize.get())
-        if len(self.speckleRange.get()) > 0:
-            stereobm_config["speckleRange"] = int(self.speckleRange.get())
-        if len(self.speckleWindowSize.get()) > 0:
-            stereobm_config["speckleWindowSize"] = int(self.speckleWindowSize.get())
-        if len(self.textureThreshold.get()) > 0:
-            stereobm_config["textureThreshold"] = int(self.textureThreshold.get())
-        if len(self.uniquenessRatio.get()) > 0:
-            stereobm_config["uniquenessRatio"] = int(self.uniquenessRatio.get())
+        for l in self.labels:
+            if len(self.entryFields[l].get()) > 0:
+                stereobm_config[l] = int(self.entryFields[l].get())
+
         HAL.Controller.Controllers[0].publish_message(0, "depthmapper",
                                                       json.dumps(stereobm_config, ensure_ascii=False))
 
-        stereobm_config
+
+class ImageInspector:
+    def __init__(self):
+        self.left_image_display = None
+        self.right_image_display = None
+        self.training_dictionary = IDEFProcess.extract_training_dictionary()
+        self.stereo_pairs = IDEFProcess.extract_training_stereo_pairs(self.training_dictionary)
+        self.stereo_pair_index = 0
+        self.blurValue = None
+
+        self.top = tk.Toplevel()
+        self.top.title("Image Inspector")
+
+        canvas_frame = tk.Frame(self.top)
+
+        self.left_image_display = self.create_image_display(canvas_frame)
+        self.right_image_display = self.create_image_display(canvas_frame)
+        canvas_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=tk.YES)
+        data_frame = tk.Frame(self.top)
+        tk.Button(data_frame, width=10, text="Previous", command=self.previous_image).pack(side=tk.LEFT)
+        self.leftBlurValue = tk.Label(data_frame, text="0.000000")
+        self.leftBlurValue.pack(side=tk.LEFT)
+        self.rightBlurValue = tk.Label(data_frame, text="0.000000")
+        self.rightBlurValue.pack(side=tk.LEFT)
+        tk.Button(data_frame, width=10, text="Delete Pair", command=self.delete_pair).pack(side=tk.LEFT)
+        tk.Button(data_frame, width=10, text="Next", command=self.next_image).pack(side=tk.LEFT)
+        tk.Button(data_frame, width=10, text="Report", command=self.report).pack(side=tk.LEFT)
+        tk.Button(data_frame, width=10, text="Weed", command=self.weed_images).pack(side=tk.LEFT)
+        data_frame.pack(side=tk.TOP)
+
+    def previous_image(self):
+        self.stereo_pair_index -= 1
+        self.update_image(True)
+        self.update_image(False)
+
+    def next_image(self):
+        self.stereo_pair_index += 1
+        self.update_image(True)
+        self.update_image(False)
+
+    def delete_pair(self):
+        pass
+
+    def create_image_display(self, parent):
+        frame = tk.Frame(parent)
+        image_display = tk.Canvas(frame, bd=6, highlightthickness=3, scrollregion=(0, 0, 500, 500))
+        hbar = tk.Scrollbar(frame, orient=tk.HORIZONTAL)
+        hbar.pack(side=tk.BOTTOM, fill=tk.X)
+        hbar.config(command=image_display.xview)
+        vbar = tk.Scrollbar(frame, orient=tk.VERTICAL)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+        vbar.config(command=image_display.yview)
+        image_display.config(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+        image_display.image_id = None
+        image_display.pack(side=tk.LEFT, fill=tk.BOTH, expand=tk.YES)
+        frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=tk.YES)
+        return image_display
+
+    def analyze_image_blur(self, imagefile):
+        image = cv2.imread(imagefile)
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # compute the Laplacian of the image and then return the focus
+        # measure, which is simply the variance of the Laplacian
+        return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+    def report(self):
+        for x in self.stereo_pairs:
+            lib = self.analyze_image_blur(self.imagefile(x, True))
+            rib = self.analyze_image_blur(self.imagefile(x, False))
+            print("{},{},{}".format(x, lib, rib))
+
+    def weed_images(self):
+        min = 90
+        maxdelta = 0.2
+        for x in self.stereo_pairs:
+            lib = self.analyze_image_blur(self.imagefile(x, True))
+            rib = self.analyze_image_blur(self.imagefile(x, False))
+            keep = lib > 90 and rib > 90 and abs(rib - lib) / min < maxdelta
+            if not keep:
+                os.remove(self.imagefile(x, True))
+                os.remove(self.imagefile(x, False))
+
+    def imagefile(self, key, isLeft):
+        fnd = "L" if isLeft else "R"
+        return IDEFProcess.stereo_session_image_folder() + "/" + key + "_unknownctlr_" + fnd + ".jpg"
+
+    def update_image(self, isLeft):
+
+        try:
+            if self.stereo_pair_index >= len(self.stereo_pairs):
+                self.stereo_pair_index = 0
+            elif self.stereo_pair_index < 0:
+                self.stereo_pair_index = len(self.stereo_pairs) - 1
+            disp = self.left_image_display if isLeft else self.right_image_display
+            fn = self.imagefile(self.stereo_pairs[self.stereo_pair_index], isLeft)
+            disp.image = ImageTk.PhotoImage(file=fn)
+            ib = self.analyze_image_blur(fn)
+            if isLeft:
+                self.leftBlurValue.config(text=str(ib))
+            else:
+                self.rightBlurValue.config(text=str(ib))
+            if disp.image_id is None:
+                disp.image_id = disp.create_image(0, 0, image=disp.image,
+                                                  anchor='nw')
+            else:
+                disp.itemconfigure(disp.image_id, image=disp.image)
+
+            disp.configure(scrollregion=disp.bbox("all"))
+            self.update()
+        except:
+            pass
+        finally:
+            pass

@@ -217,6 +217,9 @@ class IDEFProcess(ABC):
             return True
         return name in self.locals
 
+    def get_stage(self, name):
+        return self.stages[name]
+
     def run_stages(self):
         """
         Search through the stages for any reporting that they are ready to run and run their process

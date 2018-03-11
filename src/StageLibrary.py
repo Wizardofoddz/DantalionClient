@@ -14,7 +14,7 @@ from HardwareAbstractionLayer import Imager, Controller
 from Notification import Notifier
 from ProcessAbstractionLayer import IDEFStage, IDEFStageBinding, EConnection, EContainerType, EDataDirection, \
     ScalarContainer, IDEFProcess
-from TrainingSupport import StereoTrainingSet
+from TrainingSupport import StereoTrainingSet, ImageGene
 
 
 class DifferentialStage(IDEFStage):
@@ -930,7 +930,7 @@ class GeneticSolutionSearchStage(IDEFStage):
     def __init__(self, host, name):
         super().__init__(host, name)
 
-        self.num_passes = 2500
+        self.num_passes = 3333
         self.stereo_pairs = None
         self.training_dictionary = None
         self.parent_chromosomes = None
@@ -939,6 +939,8 @@ class GeneticSolutionSearchStage(IDEFStage):
         self.wins = 0
         self.losses = 0
         self.breeding_pool = []
+        self.breedthreshold = 0
+        self.genecounts = {}
         self.min_viable_population = 1
         self.minimum_fitness = 0
         self.leftside = True
@@ -946,10 +948,16 @@ class GeneticSolutionSearchStage(IDEFStage):
         self.left_intrinsics = None
         self.right_fitness = None
         self.right_intrinsics = None
-
+        self.mutations = 0
         self.wait_on_computation = False
-        self.training_dictionary = IDEFProcess.extract_training_dictionary()
-        self.stereo_pairs = IDEFProcess.extract_training_stereo_pairs(self.training_dictionary)
+
+        ImageGene.initialze()
+        self.training_dictionary = ImageGene.GeneDictionary
+        self.stereo_pairs = ImageGene.StereoPairs
+        self.on_breeder_added = None
+        self.on_parents_selected = None
+        self.on_cycle_completed = None
+        self.on_child_tested = None
 
     def get_required_containers(self):
         " Need an input image (RAWIMAGE), a last image to compute difference from (LASTIMAGE),\
@@ -994,6 +1002,7 @@ class GeneticSolutionSearchStage(IDEFStage):
                 c = r.chromosome
                 self.add_breeder(c, fm)
             self.input_containers['POPULATIONSEED'].value = None
+
         pi = self.environment_containers['PAIRINDEX'].value
         if pi == 0:
             # reset the downstream processors
@@ -1001,10 +1010,13 @@ class GeneticSolutionSearchStage(IDEFStage):
             self.host_process.stages['DistortionCalculatorStage'].initialize_container_impedance()
 
         if self.parent_chromosomes is None:
+            self.environment_containers['SELECTED_STEREO_PAIRS'].value = None
             self.update_parent_chromosomes()
 
         if self.environment_containers['SELECTED_STEREO_PAIRS'].value is None:
             spi = self.generate_child(self.cossover_perturb_ratio, self.mutation_ratio)
+            if self.on_child_tested is not None:
+                self.on_child_tested(spi, self.mutations)
             self.environment_containers['SELECTED_STEREO_PAIRS'].value = spi
             self.environment_containers['PAIRINDEX'].value = 0
             self.leftside = True
@@ -1045,8 +1057,17 @@ class GeneticSolutionSearchStage(IDEFStage):
     def fitness_minimum(self, fitness):
         return min(fitness[0], fitness[1])
 
+    def count_breeder_change(self, chromosome, delta):
+        for g in chromosome:
+            if g in self.genecounts:
+                self.genecounts[g] += delta
+            else:
+                self.genecounts[g] = delta
+
     def add_breeder(self, chromosome, fitness):
+        self.count_breeder_change(chromosome, 1)
         if len(self.breeding_pool) >= self.control_containers['POPULATIONLIMIT'].value:
+            self.count_breeder_change(self.breeding_pool[0][0], -1)
             self.breeding_pool[0] = (chromosome, fitness)
         else:
             self.breeding_pool.append((chromosome, fitness))
@@ -1061,16 +1082,25 @@ class GeneticSolutionSearchStage(IDEFStage):
                 print('Required: {}'.format(self.minimum_fitness))
             else:
                 print('+', end='', flush=True)
+        if self.on_breeder_added is not None:
+            self.on_breeder_added(chromosome, fitness, self.breeding_pool, self.genecounts)
 
     def update_parent_chromosomes(self):
         if len(self.breeding_pool) < self.control_containers['POPULATIONLIMIT'].value:
             self.parent_chromosomes = [random.sample(self.stereo_pairs, self.control_containers['NUMPAIRS'].value),
                                        random.sample(self.stereo_pairs, self.control_containers['NUMPAIRS'].value)]
         else:
-            mc = random.sample(self.breeding_pool, 2)
-            self.parent_chromosomes = [mc[0][0], mc[1][0]]
+            mi = random.sample(range(0, self.control_containers['POPULATIONLIMIT'].value), 2)
+            if self.on_parents_selected is not None:
+                c1 = self.breeding_pool[mi[0]][0]
+                c2 = self.breeding_pool[mi[1]][0]
+                self.on_parents_selected(c1, c2)
+            c1 = self.breeding_pool[mi[0]][0]
+            c2 = self.breeding_pool[mi[1]][0]
+            self.parent_chromosomes = [c1, c2]
         self.wins = 0
         self.losses = 0
+        self.breedthreshold = 1
 
     def generate_child(self, cossover_perturb_ratio, mutation_ratio):
         p1 = self.parent_chromosomes[0]
@@ -1095,40 +1125,66 @@ class GeneticSolutionSearchStage(IDEFStage):
             else:
                 c[i1] = p2[i2]
         # handle gene duplications
-        dupes = [n for n, x in enumerate(c) if x in c[:n]]
-        for i in dupes:
-            c[i] = random.sample(self.stereo_pairs, 1)[0]
-        # handle the mutuations if none were required for gene duplication
-        if len(dupes) == 0:
-            for i in range(0, len(p1)):
-                if random.random() <= mutation_ratio:
-                    c[i] = random.sample(self.stereo_pairs, 1)[0]
+        mutation_applied = False
+        gestating = True
+        while gestating:
+            unique = True
+            dupes = [n for n, x in enumerate(c) if x in c[:n]]
+            for i in dupes:
+                c[i] = random.sample(self.stereo_pairs, 1)[0]
+                self.mutations += 1
+            unique = len(dupes) == 0
+            # handle the mutuations if none were required for gene duplication
+            if unique and not mutation_applied:
+                for i in range(0, len(p1)):
+                    if random.random() <= mutation_ratio:
+                        c[i] = random.sample(self.stereo_pairs, 1)[0]
+                        self.mutations += 1
+                        unique = False
+            if unique:
+                for bpchrom in self.breeding_pool:
+                    if bpchrom[0] == c:
+                        ii = random.sample(range(0, len(c)), 1)[0]
+                        c[ii] = random.sample(self.stereo_pairs, 1)[0]
+                        self.mutations += 1
+                        unique = False
+            mutation_applied = True
+            # done gestating IFF the child has been determined to be unique
+            gestating = not unique
         return c
-
-    def bailout(self, isSuccess):
-        print('.', end='', flush=True)
-        self.environment_containers['SELECTED_STEREO_PAIRS'].value = None
-
-        self.num_passes -= 1
-        if self.num_passes <= 0:
-            self.host_process.completed = True
-        if isSuccess:
-            self.wins += 1
-        else:
-            self.losses += 1
-        gc = self.wins + self.losses
-        if gc > self.min_viable_population / 4 and (self.losses / gc) > 0.677:
-            print('regenerating')
-            self.update_parent_chromosomes()
 
     def cycle_completed(self, chromosome):
         success = False
         if self.left_fitness >= self.minimum_fitness and self.right_fitness >= self.minimum_fitness:
             self.add_breeder(chromosome, (self.left_fitness, self.right_fitness))
             self.log_data(chromosome)
-            self.update_parent_chromosomes()
             success = True
-        self.bailout(success)
+        print('.', end='', flush=True)
+        self.environment_containers['SELECTED_STEREO_PAIRS'].value = None
+
+        self.num_passes -= 1
+        if self.num_passes <= 0:
+            self.host_process.completed = True
+        if success:
+            self.wins += 1
+        else:
+            self.losses += 1
+        gc = self.wins + self.losses
+        lossratio = float(self.losses / gc)
+        # msg = "Wins: {} Losses: {}   Ttl: {}   lossrat: {}  threshold: {}".format(self.wins, self.losses, gc,
+        #                                                                           lossratio, self.breedthreshold)
+        # print(msg)
+        parentschanged = False
+        if len(self.breeding_pool) < self.control_containers['POPULATIONLIMIT'].value:
+            self.update_parent_chromosomes()
+            parentschanged = True
+        elif gc > 2 and lossratio >= self.breedthreshold:
+            self.update_parent_chromosomes()
+            parentschanged = True
+        self.breedthreshold -= (1 / (gc + 5))
+        if self.on_cycle_completed is not None:
+            self.on_cycle_completed(self.minimum_fitness, self.left_fitness, self.right_fitness, success,
+                                    parentschanged)
 
     def log_data(self, chromosome):
         id = uuid.uuid4().hex

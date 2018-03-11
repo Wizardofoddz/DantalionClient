@@ -82,7 +82,12 @@ class Controller:
 
         if termz[2] == "status":
             client.controller.imagers[camno].status = message.payload.decode()
-        elif termz[2] == "raw" or termz[2] == 'rectified' or termz[2] == 'depth':
+        elif termz[2] == "depthmapper":
+            "peel apart the json return and make a map out of it"
+            client.controller.stereomapper_coefficients = json.loads(message.payload.decode())
+        elif termz[2].startswith("depth"):
+            client.controller.imagers[camno].process_live_image(bytearray(message.payload), termz[2])
+        elif termz[2] == "raw" or termz[2] == 'rectified':
             if termz[3] != Controller.GatedKey:
                 if Controller.GatedKey is not None:
                     print('sync failure')
@@ -91,7 +96,7 @@ class Controller:
             else:
                 with client.controller.image_aquisition_mutex:
                     client.controller.image_key = Controller.GatedKey
-                    client.controller.imagers[camno].process_live_image(bytearray(message.payload), termz[2])
+                    # client.controller.imagers[camno].process_live_image(bytearray(message.payload), termz[2])
                     client.controller.imagers[Controller.GatedMessage[0]].process_live_image(
                         bytearray(Controller.GatedMessage[1]), Controller.GatedMessage[2])
                     Controller.GatedKey = None
@@ -130,6 +135,8 @@ class Controller:
             ang = (i * step) + (step * 0.5)
             a_camera = Imager(self, i, np.array([0, ang]), i)
             self.imagers.append(a_camera)
+
+        self.stereomapper_coefficients = None
 
         # initialize the camera image receiver
         self.mqtt_client = mqtt.Client(self.resource)
@@ -241,6 +248,8 @@ class Imager(object):
         self.process_live_images = True
         self.submit_image_to_processes = None
 
+        self.video_enabled = True
+
     def get_resolution(self):
         if self.resolution_code == 1:
             return 160, 120
@@ -339,6 +348,8 @@ class Imager(object):
         return self.raw_image[channel], self.cv2_image_array[channel], self.image_metadata[channel]
 
     def process_live_image(self, rawdata, channel):
+        if not self.video_enabled:
+            return
         """ Load time related images in parallel
 
         :param channel: defines the mqtt channel the image was received on
@@ -352,6 +363,9 @@ class Imager(object):
             # store image for channel
             self.raw_image[channel] = rawdata
             self.cv2_image_array[channel] = cv2.imdecode(np.asarray(rawdata, dtype="uint8"), cv2.IMREAD_COLOR)
+            if channel == "depth_conf":
+                self.cv2_image_array[channel] = cv2.applyColorMap(self.cv2_image_array[channel], cv2.COLORMAP_JET)
+                self.raw_image[channel] = cv2.imencode('.jpg', self.cv2_image_array[channel])[1]
 
             image = Image.open(io.BytesIO(rawdata))
             exif_data = image._getexif()
